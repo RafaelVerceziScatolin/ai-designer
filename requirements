@@ -1,0 +1,31 @@
+Windows
+
+conda create -n dl_torch python=3.10
+conda activate dl_torch
+conda install matplotlib scikit-learn tqdm nltk
+conda install -c conda-forge pydotplus ipywidgets mlxtend
+conda install pytorch torchvision torchaudio cpuonly -c pytorch
+conda install -c conda-forge pytorch-lightning tensorboard shapely
+conda install pyg -c pyg
+pip install torch-scatter -f https://data.pyg.org/whl/torch-2.4.1+cpu.html
+pip install tqdm_joblib
+
+
+Verify torch version to install torch-scatter
+import torch, platform, os
+print(torch.__version__)  
+
+
+
+
+Linux
+
+conda create -n dl_torch python=3.10
+conda activate dl_torch
+conda install matplotlib scikit-learn tqdm nltk
+conda install -c conda-forge pydotplus ipywidgets mlxtend
+conda install pytorch torchvision torchaudio pytorch-cuda=12.1 -c pytorch -c nvidia
+conda install -c conda-forge pytorch-lightning tensorboard shapely
+conda install pyg -c pyg
+conda install -c pyg -c conda-forge torch-scatter
+pip install tqdm_joblib
