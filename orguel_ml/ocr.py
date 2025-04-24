@@ -307,3 +307,9 @@ class OCRNetwork(nn.Module):
         }
         
         return output
+
+
+
+def GetBBox():
+    
+
