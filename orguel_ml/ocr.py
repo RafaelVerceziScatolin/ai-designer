@@ -307,3 +307,4 @@ class OCRNetwork(nn.Module):
         }
         
         return output
+
