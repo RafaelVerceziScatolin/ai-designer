@@ -29,7 +29,6 @@ def __get_characters():
     return character_set
 
 character_set = __get_characters()
-height_list = [8, 10, 12, 14, 18, 22.5, 27, 35, 80, 90]
 
 import numpy
 from typing import List, Tuple
