@@ -8,6 +8,7 @@ def __get_characters():
                                 "latin_lower": "abcdefghijklmnopqrstuvwxyz",
                                 "numbers": "0123456789",
                                 "basic_latin": "!\"#$%&'*+,-./:;=?@\\_`|~()[]{}<>",
+                                "supplementary_latin": "º",
                                 "special_upper": "ÀÁÂÃÇÉÊÍÓÔØÚ",
                                 "special_lower": "àáâãçéêíóô÷øú"
                             },
@@ -29,6 +30,7 @@ def __get_characters():
     return character_set
 
 character_set = __get_characters()
+width_factors = (0.8, 1.0, 1.2)
 
 import numpy
 from typing import List, Tuple

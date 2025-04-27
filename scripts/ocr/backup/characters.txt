@@ -1,0 +1,41 @@
+latin_upper = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+latin_lower = "abcdefghijklmnopqrstuvwxyz"
+greek_upper = "ΑΒΓΔΕΖΗΘΙΚΛΜΝΞΟΠΡΣΤΥΦΧΨΩ"
+greek_lower = "αβγδεζηθικλμνξοπρστυφχψω"
+numbers = "0123456789"
+basic_latin = "!\"#$%&'*+,-./:;=?@\\^_`|~()[]{}<>"
+supplementary_latin = "¡¢£¤¥¦§¨©ª«¬­®¯°±²³´µ¶·¸¹º»¿"
+special_upper = "ÀÁÂÃÄÅÆÇÈÉÊËÌÍÎÏÐÑÒÓÔÕÖ×ØÙÚÛÜÝ"
+special_lower = "Þßàáâãäåæçèéêëìíîïðñòóôõö÷øùúûüýþÿ"
+general_punctuation = "–—―‗‘’‛“”„†‡•…‰′″‹›‼‽‾⁄"
+superscripts = "⁰⁴⁵⁶⁷⁸⁹ⁿ"
+subscripts = "₀₁₂₃₄₅₆₇₈₉"
+coins = "₠₡₢₣₤₥₦₧₨₩₪₫€₭₮₯₰₱₲₳₴₵₶₷₸₹₺₻₼₽₾₿⃀"
+arrows = "←↑→↓↔↕↖↗↘↙↨"
+math_operators = "∂∆∏∑−∕∙√∞∟∩∫∶≈≠≡≤≥∪∈∉∴∵∇∠"
+
+
+                                "Arial": "arial.ttf",
+                                "Calibri": "calibri.ttf",
+                                "Times New Roman": "times.ttf",
+                                #"Courier New": "cour.ttf",
+                                "Verdana": "verdana.ttf",
+                                "Segoe UI": "segoeui.ttf",
+                                "Tahoma": "tahoma.ttf",
+                                "Consolas": "consola.ttf",
+                                "Helvetica": "helvetica.ttf",
+                                "TXT": "txt.shx",
+                                "SIMPLEX": "simplex.shx",
+                                "ROMANS": "romans.shx",
+                                #"ROMAND": "romand.shx",
+                                "ISOCP": "isocp.shx",
+                                "ISOCT": "isoct.shx",
+                                "ISOCPEUR": "isocpeur.shx",
+                                #"Complex": "complex.shx",
+                                "Technic": "technic.shx"
+                                #"ScriptC": "scriptc.shx"
+
+
+"Swis 721 Cn BT": "swissc.ttf"
+
+[7.5, 8, 9, 10, 10.5, 11, 12, 12.5, 13.5, 14, 17.5, 18, 20, 21, 22.5, 25, 27, 30, 35, 80, 90]
