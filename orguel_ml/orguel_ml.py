@@ -419,7 +419,7 @@ import os
 from tqdm import tqdm
 from multiprocessing import Pool
 
-class GraphDataset(torch.utils.data.Dataset):
+class CreateGraphDataset(torch.utils.data.Dataset):
     def __init__(self, dxf_files, CreateGraph=CreateGraph, chunksize=4):
         self.graphs = []
         with Pool(processes=os.cpu_count()) as pool:
