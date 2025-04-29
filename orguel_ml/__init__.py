@@ -1,1 +1,1 @@
-from .orguel_ml import (Graph, GraphDataset, BalanceClassWeights, GraphGPSNetwork)
+from .orguel_ml import (Graph, CreateGraphDataset, BalanceClassWeights, GraphGPSNetwork)
