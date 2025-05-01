@@ -84,14 +84,6 @@ import torch
 from scipy.spatial import cKDTree
 from torch_geometric.data import Data
 
-def __rotate_around_origin(x, y, rotation):
-    rotation_rad = math.radians(rotation)
-    cos_a = math.cos(rotation_rad)
-    sin_a = math.sin(rotation_rad)
-    rx = x * cos_a - y * sin_a
-    ry = x * sin_a + y * cos_a
-    return rx, ry
-
 def CreateGraph(dxf_file, spacing=500, cluster_radius=200, character_set=character_set):
     
     # Load DXF
