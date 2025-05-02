@@ -31,6 +31,8 @@ def __get_characters():
 
 character_set = __get_characters()
 width_factors = (0.8, 1.0, 1.2)
+rotations= [i * 15 for i in range(24)]
+scales = [0.5*i for i in range(14, 60)] + [5*i for i in range(6, 21)]
 
 import numpy
 from typing import List, Tuple
@@ -44,139 +46,175 @@ class Graph(BaseGraph):
                             "overlap_ratio": 0,
                             "point_intersection": 0,
                             "segment_intersection": 0,
-                            "angle_difference": 0
+                            "angle_difference": 0,
+                            "angle_difference_sin": 0,
+                            "angle_difference_cos": 0,
                         }
-    def __init__(self, dataframe):
+    
+    def __init__(self, dataframe, normalization_factor):
         self.__dataframe = dataframe
         
-        coordinates_x = dataframe[['start_x', 'end_x', 'cluster_insertion_x']]
-        coordinates_y = dataframe[['start_y', 'end_y', 'cluster_insertion_y']]
+        coordinates_x = dataframe[['start_x', 'end_x', 'character_insertion_x']].values.flatten()
+        coordinates_y = dataframe[['start_y', 'end_y', 'character_insertion_y']].values.flatten()
         
         normalizedCoordinates = dataframe[['start_x', 'start_y', 'end_x', 'end_y']].copy()
         normalizedCoordinates[['start_x', 'end_x']] = (normalizedCoordinates[['start_x', 'end_x']] - coordinates_x.values.mean()) / coordinates_x.values.std()
         normalizedCoordinates[['start_y', 'end_y']] = (normalizedCoordinates[['start_y', 'end_y']] - coordinates_y.values.mean()) / coordinates_y.values.std()
         
         normalizedAngles = numpy.column_stack((numpy.sin(dataframe['angle']), numpy.cos(dataframe['angle'])))
-        normalizedLengths = dataframe[['length']] / 176.53671467337412
         
-        cluster = dataframe.groupby("cluster_id")
+        if normalization_factor: normalizationFactor = normalization_factor
+        else: normalizationFactor = dataframe[['length', 'character_height', 'character_width']].values.max()
+          
+        normalizedLengths = dataframe[['length']] / normalizationFactor
+        normalizedCharacterHeigth = dataframe[['character_height']] / normalizationFactor
+        normalizedCharacterWidth = dataframe[['character_width']] / normalizationFactor
+        
+        characters = dataframe.groupby("character_id")
         
         self.classificationLabels = {
-            "label": cluster['cluster_label'].first().values,
-            "font": cluster['cluster_font'].first().values
+            "type": characters['character_type'].first().values,
+            "font": characters['character_font'].first().values
         }
+        
         self.regressionTargets = {
-            "height": cluster['cluster_height'].first().values / 176.53671467337412,
-            "rotation": cluster['cluster_rotation'].first().values,
-            "insertion_x": ((cluster['cluster_insertion_x'].first() - coordinates_x.values.mean()) / coordinates_x.values.std()).values,
-            "insertion_y": ((cluster['cluster_insertion_y'].first() - coordinates_y.values.mean()) / coordinates_y.values.std()).values
+            "height": normalizedCharacterHeigth.groupby(dataframe['character_id']).first().values,
+            "width": normalizedCharacterWidth.groupby(dataframe['character_id']).first().values,
+            "rotation": characters['character_rotation'].first().values,
+            "insertion_x": ((characters['character_insertion_x'].first() - coordinates_x.values.mean()) / coordinates_x.values.std()).values,
+            "insertion_y": ((characters['character_insertion_y'].first() - coordinates_y.values.mean()) / coordinates_y.values.std()).values
         }
+        
         self.nodesAttributes = numpy.hstack([normalizedCoordinates.values, normalizedAngles, normalizedLengths.values])
         self.edges: List[Tuple[int, int]] = []
         self.edgesAttributes: List[List[float]] = []
 
 from typing import Dict
-import os
 import math
 import pandas
 import ezdxf
 import torch
-from scipy.spatial import cKDTree
 from torch_geometric.data import Data
+from shapely.geometry import Point
+from shapely.strtree import STRtree
+from shapely.affinity import rotate as shapely_rotate
+from shapely.affinity import scale as shapely_scale
+from .orguel_ml import LaplacianEigenvectors
 
-def CreateGraph(dxf_file, spacing=500, cluster_radius=200, character_set=character_set):
+def __rotate_and_scale(x, y, angle, scale):
+    angle_rad = math.radians(angle)
+    x_aligned = x * scale * math.cos(angle_rad) - y * scale * math.sin(angle_rad)
+    y_aligned = x * scale * math.sin(angle_rad) + y * scale * math.cos(angle_rad)
+    return x_aligned, y_aligned
+
+def CreateGraph(dxf_file, character_positions, rotation=0, scale=1.0, normalization_factor=None):
+    # Filter only rows for this dxf file
+    characterPositions = character_positions[character_positions['file'] == dxf_file].copy()
     
-    # Load DXF
-    fileName = os.path.basename(dxf_file)
-    fontName = fileName.split("_")[0]
-    height = float(fileName.split("_height")[-1].split("_local")[0].split("_global")[0].replace(".dxf", "").replace("_", "."))
-    rotation = float(fileName.split("_local")[-1].split("_global")[-1].replace(".dxf", "").replace("_", ".")) if 'local' in fileName or 'global' in fileName else 0
-    
+    # Apply transform to bbox and insertion point
+    for i, row in characterPositions.iterrows():
+        bboxAligned = shapely_rotate(row['bbox'], angle=rotation, origin=(0, 0), use_radians=False)
+        bboxAligned = shapely_scale(bboxAligned, xfact=scale, yfact=scale, origin=(0, 0))
+        characterPositions.at[i, 'bbox'] = bboxAligned
+        
+        insertion_x, insertion_y = row['insertion']
+        aligned_insertion_x, aligned_insertion_y = __rotate_and_scale(insertion_x, insertion_y, rotation, scale)
+        characterPositions.at[i, 'insertion'] = (aligned_insertion_x, aligned_insertion_y)
+        
+        characterPositions.at[i, 'height'] = row['height'] * scale
+        characterPositions.at[i, 'width'] = row['width'] * scale
+        characterPositions.at[i, 'rotation'] = (row['rotation'] + math.radians(rotation)) % (2 * math.pi)
+
+    # Prepare spatial index
+    polygons = list(characterPositions['bbox'])
+    space2D = STRtree(polygons)
+    polygonToRow = {id(polygon): row for _, row in characterPositions.iterrows() for polygon in [row['bbox']]}
+
     doc = ezdxf.readfile(dxf_file)
     modelSpace = doc.modelspace()
     lineCollector = [line for line in modelSpace if line.dxftype() == 'LINE']
-    
-    # Extract centroids and full line geometry
+
     dataframe: List[Dict] = []
-    centroids: List[Tuple[float, float]] = []
+
     for line in lineCollector:
         start_x, start_y, _ = line.dxf.start
         end_x, end_y, _ = line.dxf.end
-        centroid = ((start_x + end_x) / 2, (start_y + end_y) / 2)
         
+        # Apply rotation and scaling
+        start_x, start_y = __rotate_and_scale(start_x, start_y, rotation, scale)
+        end_x, end_y = __rotate_and_scale(end_x, end_y, rotation, scale)
+        
+        centroid = Point(((start_x + end_x) / 2, (start_y + end_y) / 2))
+
         length = math.hypot(end_x - start_x, end_y - start_y)
-        angle = math.atan2(end_y - start_y, end_x - start_x) % math.pi
-        
+        angle = math.atan2(end_y - start_y, end_x - start_x) % (2*math.pi)
+
         nlen = math.hypot(start_y - end_y, end_x - start_x)
         offset = 0.0 if nlen < 1e-12 else abs(start_x * ((start_y - end_y) / nlen) + start_y * ((end_x - start_x) / nlen))
-        
-        centroids.append(centroid)
-        dataframe.append(
-            {
-                "cluster_id": 0,
-                "cluster_font": character_set["font"]["encoding"][fontName],
-                "cluster_height": height,
-                "cluster_rotation": rotation / 360,
-                "cluster_label": 0,
-                "cluster_insertion_x": 0,
-                "cluster_insertion_y":0,
-                "start_x": start_x,
-                "start_y": start_y,
-                "end_x": end_x,
-                "end_y": end_y,
-                "length": length,
-                "angle": angle,
-                "offset": offset,
-                "circle": 0,
-                "arc": 0,
-                "radius": 0,
-                "start_angle": 0,
-                "end_angle": 0
-            }
-        )
 
-    # Build KDTree for spatial lookup
-    space2D = cKDTree(centroids)
-    
-    # Cluster lines based on known insertion points
-    id=0
-    y=0
-    for group, characters in character_set["characters"]["type"].items():
-        x=50
-        for character in characters:
-            insertionPoint = (x, y)
-            if "_global" in fileName: insertionPoint = __rotate_around_origin(x, y, rotation)
-            
-            clusterIndexes = space2D.query_ball_point(insertionPoint, cluster_radius)
-            for i in clusterIndexes:
-                dataframe[i]["cluster_id"] = id
-                dataframe[i]["cluster_label"] = character_set["characters"]["encoding"][character]
-                dataframe[i]["cluster_insertion_x"] = insertionPoint[0]
-                dataframe[i]["cluster_insertion_y"] = insertionPoint[1]
-            
-            id += 1
-            x += spacing
-        y -= spacing
-                
+        label = {
+            "character_id": 0,
+            "character_font": 0,
+            "character_type": 0,
+            "character_height": 0,
+            "character_width": 0,
+            "character_rotation": 0,
+            "character_insertion_x": 0,
+            "character_insertion_y": 0,
+            "start_x": start_x,
+            "start_y": start_y,
+            "end_x": end_x,
+            "end_y": end_y,
+            "length": length,
+            "angle": angle,
+            "offset": offset,
+            "circle": 0,
+            "arc": 0,
+            "radius": 0,
+            "start_angle": 0,
+            "end_angle": 0
+        }
+
+        # Use spatial index to find potential matches
+        for polygon in space2D.query(centroid):
+            if polygon.contains(centroid):
+                row = polygonToRow[id(polygon)]
+                font = character_set['font']['encoding'].get(row['font'], 0)
+                character = character_set['characters']['encoding'].get(row['character'], 0)
+
+                label.update({
+                    "character_id": row.name,
+                    "character_font": font,
+                    "character_type": character,
+                    "character_height": row['height'],
+                    "character_width": row['width'],
+                    "character_rotation": row['rotation'] / (2 * math.pi),
+                    "character_insertion_x": row['insertion'][0],
+                    "character_insertion_y": row['insertion'][1]
+                })
+                break
+
+        dataframe.append(label)
+
     dataframe = pandas.DataFrame(dataframe)
     
-    graph = Graph(dataframe)
+    graph = Graph(dataframe, normalization_factor)
     graph.ParallelDetection()
     graph.IntersectionDetection()
     
-    # Convert all tensors
     graph.classificationLabels = {
-        "label": torch.tensor(graph.classificationLabels["label"], dtype=torch.long),
+        "type": torch.tensor(graph.classificationLabels["type"], dtype=torch.long),
         "font": torch.tensor(graph.classificationLabels["font"], dtype=torch.long)
     }
     
     graph.regressionTargets = {
         "height": torch.tensor(graph.regressionTargets["height"], dtype=torch.float),
+        "width": torch.tensor(graph.regressionTargets["width"], dtype=torch.float),
         "rotation": torch.tensor(graph.regressionTargets["rotation"], dtype=torch.float),
         "insertion_x": torch.tensor(graph.regressionTargets["insertion_x"], dtype=torch.float),
         "insertion_y": torch.tensor(graph.regressionTargets["insertion_y"], dtype=torch.float)
     }
-
+    
     graph.nodesAttributes = torch.tensor(graph.nodesAttributes, dtype=torch.float)
     graph.edges = torch.tensor(graph.edges, dtype=torch.long).t().contiguous()
     graph.edgesAttributes = torch.tensor(graph.edgesAttributes, dtype=torch.float)
@@ -186,18 +224,41 @@ def CreateGraph(dxf_file, spacing=500, cluster_radius=200, character_set=charact
         x=graph.nodesAttributes,
         edge_index=graph.edges,
         edge_attr=graph.edgesAttributes,
-        y=graph.classificationLabels["label"],
+        y=graph.classificationLabels["type"],
         font=graph.classificationLabels["font"],
         height=graph.regressionTargets["height"],
+        width=graph.regressionTargets["width"],
         rotation=graph.regressionTargets["rotation"],
         insertion_x=graph.regressionTargets["insertion_x"],
         insertion_y=graph.regressionTargets["insertion_y"],
-        cluster_id=torch.tensor(dataframe["cluster_id"].values, dtype=torch.long)
+        cluster_id=torch.tensor(dataframe["character_id"].values, dtype=torch.long)
     )
-
-    #graph: Data = LaplacianEigenvectors(graph)
     
-    return graph
+    graph: Data = LaplacianEigenvectors(graph, k=4)
+    
+    return dataframe
+
+import os
+from tqdm import tqdm
+from multiprocessing import Pool
+
+def __create_graph_worker(args):
+    return CreateGraph(*args)
+
+class CreateGraphDataset(torch.utils.data.Dataset):
+    def __init__(self, arguments, chunksize=4):
+        self.graphs = []
+        with Pool(processes=os.cpu_count()) as pool:
+            for graph in tqdm(pool.imap_unordered(__create_graph_worker, arguments, chunksize=chunksize),
+                              total=len(arguments),
+                              desc="Creating graphs"):
+                self.graphs.append(graph)
+    
+    def __len__(self):
+        return len(self.graphs)
+    
+    def __getitem__(self, idx):
+        return self.graphs[idx]
 
 import torch.nn as nn
 import torch.nn.functional as F
