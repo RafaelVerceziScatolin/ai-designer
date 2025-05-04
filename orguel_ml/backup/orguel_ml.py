@@ -15,6 +15,8 @@ class Graph:
                             "point_intersection": 0,
                             "segment_intersection": 0,
                             "angle_difference": 0,
+                            "angle_difference_sin": 0,
+                            "angle_difference_cos": 0,
                             "perimeter_intersection": 0
                         }
     def __init__(self, dataframe):
@@ -26,9 +28,8 @@ class Graph:
         normalizedCoordinates[['start_x', 'end_x']] = (coordinates_x - coordinates_x.values.mean()) / coordinates_x.values.std()
         normalizedCoordinates[['start_y', 'end_y']] = (coordinates_y - coordinates_y.values.mean()) / coordinates_y.values.std()
         
-        normalizedAngles = numpy.column_stack((numpy.sin(dataframe['angle']), numpy.cos(dataframe['angle'])))
-        normalizedLengths = (dataframe[['length']] - dataframe["length"].min()) / \
-                             (dataframe["length"].max() - dataframe["length"].min())
+        normalizedAngles = numpy.column_stack((numpy.sin(dataframe['angle']), numpy.cos(dataframe['angle']))) 
+        normalizedLengths = dataframe[['length']] / dataframe["length"].max()
         circleFlags = dataframe[['circle']].values
         arcFlags = dataframe[['arc']].values
         
@@ -91,7 +92,7 @@ class Graph:
         return overlapAinB, overlapBinA
     
     @staticmethod
-    def __point_intersection(intersection, endpoints, threshold):
+    def __is_point_intersection(intersection, endpoints, threshold):
         ix, iy = intersection
         for ex, ey in endpoints:
             distance = math.dist((ix, iy), (ex, ey))  # Euclidean distance
@@ -117,51 +118,57 @@ class Graph:
             points.append((px, py))
         return points
 
+    
+
     def ParallelDetection(self, max_threshold=50, colinear_threshold=0.5, min_overlap_ratio=0.2, angle_tolerance=numpy.radians(0.01)):
+        dataframe = self.__dataframe.copy()
+        dataframe['angle'] = dataframe['angle'] % math.pi  # collapse symmetrical directions
+        
         # create the 2D space for parallel detection
-        space2D = cKDTree(self.__dataframe[['angle', 'offset']].values)
+        space2D = cKDTree(dataframe[['angle', 'offset']].values)
         
         # Query for nearby parallel lines in (angle, offset) space
-        parallelList: List[Tuple[int, int, float, float, float]] = []  # i, j, distance, overlapA, overlapB
-        for i in range(len(self.__dataframe)):
-            line_i = self.__dataframe.iloc[i]
+        total_checks = 0 #DEBUG
+        for i in range(len(dataframe)):
+            total_queries = 0 #DEBUG
+            total_nearby_lines = 0 #DEBUG
+            line_i = dataframe.iloc[i]
             if line_i['circle'] or line_i['arc']: continue
             
-            angle_i, offset_i = self.__dataframe[['angle', 'offset']].values[i]
+            angle_i, offset_i = dataframe[['angle', 'offset']].values[i]
             nearbyLines = space2D.query_ball_point([angle_i, offset_i], r=max_threshold)
+            total_queries += 1 #DEBUG
+            total_nearby_lines += len(nearbyLines) #DEBUG
             
             for j in nearbyLines:
+                total_checks += 1 #DEBUG
+                print(f"[DEBUG] ParallelDetection total edge checks: {total_checks}") #DEBUG
                 if i >= j: continue
                 
-                line_j = self.__dataframe.iloc[j]
+                line_j = dataframe.iloc[j]
                 if line_j['circle'] or line_j['arc']: continue
                 
                 overlapA, overlapB = self.__overlap_ratios(line_i, line_j)
                 if min(overlapA, overlapB) <= min_overlap_ratio: continue
                 
-                angle_j, offset_j = self.__dataframe[['angle', 'offset']].values[j]
+                angle_j, offset_j = dataframe[['angle', 'offset']].values[j]
                 if abs(angle_i - angle_j) >= angle_tolerance: continue
                 
                 # perpendicular distance between the two parallel lines
                 distance = abs(offset_j - offset_i) / numpy.cos(angle_i)
                 
-                parallelList.append((i, j, distance, overlapA, overlapB))
+                # Assign normalized distances to edges
+                for (a, b, overlapRatio) in [(i, j, overlapA), (j, i, overlapB)]:
+                    edgeAttributes = self.__edge_attributes.copy()
+                    edgeAttributes["parallel"] = 1
+                    edgeAttributes["colinear"] = 1 if distance < colinear_threshold else 0
+                    edgeAttributes["perpendicular_distance"] = distance / dataframe["length"].max()
+                    edgeAttributes["overlap_ratio"] = overlapRatio
+                    self.edges.append((a, b))
+                    self.edgesAttributes.append(list(edgeAttributes.values()))
                     
-        min_distance = min(distance[2] for distance in parallelList)
-        max_distance = max(distance[2] for distance in parallelList)
-        max_min_distance = max_distance - min_distance if max_distance != min_distance else 1
-        
-        # Second pass to assign normalized distances to edges
-        for (i, j, distance, overlapA, overlapB) in parallelList:
-            for (a, b, overlapRatio) in [(i, j, overlapA), (j, i, overlapB)]:
-                edgeAttributes = self.__edge_attributes.copy()
-                edgeAttributes["parallel"] = 1
-                edgeAttributes["colinear"] = 1 if distance < colinear_threshold else 0
-                edgeAttributes["perpendicular_distance"] = (distance - min_distance) / max_min_distance
-                edgeAttributes["overlap_ratio"] = overlapRatio
-                self.edges.append((a, b))
-                self.edgesAttributes.append(list(edgeAttributes.values()))
-    
+        print(f"Average nearby lines per query: {total_nearby_lines / total_queries:.2f}") #DEBUG
+             
     def IntersectionDetection(self, threshold=0.5, co_linear_tolerance=numpy.radians(0.01)):
         # Step 1: Separate lines vs circles
         geometryCircular: List[Tuple[int, LineString]] = []
@@ -187,8 +194,7 @@ class Graph:
         # Build STRtree for lines
         space2D = STRtree([geometry for _, geometry in geometryLines])
         
-        # Step 2: First pass: Compute all angle differences
-        intersectionsList: List[Tuple[int, int, Tuple[float, float], float]] = [] # (i, j, intersection, angleDifference)
+        # Step 2: Compute all angle differences
         for i, lineA in geometryLines:
             nearbyLines = space2D.query(lineA)  # Fetch only nearby lines
             
@@ -200,9 +206,9 @@ class Graph:
                 # Angle check (skip nearly identical lines)
                 angle_i = self.__dataframe.iloc[i]["angle"]
                 angle_j = self.__dataframe.iloc[j]["angle"]
-                angleDifference = abs(angle_i - angle_j)
-                angleDifference = min(angleDifference, math.pi - angleDifference)
-                if angleDifference < co_linear_tolerance: continue
+                minAngleDifference = (angle_j - angle_i) % math.pi
+                minAngleDifference = min(minAngleDifference, math.pi - minAngleDifference)
+                if minAngleDifference < co_linear_tolerance: continue
                 
                 # Step 3: Check actual intersection
                 intersection = lineA.intersection(lineB)
@@ -218,28 +224,23 @@ class Graph:
                 elif intersection.geom_type == "MultiPoint":intersection = list(intersection.geoms)[0].coords[0]
                 else: intersection = intersection.interpolate(0.5, normalized=True).coords[0]
                 
-                intersectionsList.append((i, j, intersection, angleDifference))
+                angleDifference = (angle_j - angle_i) % (2 * math.pi)
                 
-        # Normalize angle differences
-        min_angle_difference = min(intersection[3] for intersection in intersectionsList)
-        max_angle_difference = max(intersection[3] for intersection in intersectionsList)
-        max_min_angle_difference = max_angle_difference - min_angle_difference if max_angle_difference != min_angle_difference else 1
+                # Step 5: Add edges with normalized angleDifference
+                for a, b in [(i, j), (j, i)]:
+                    row = self.__dataframe.iloc[a]
+                    rowPoints = [(row["start_x"], row["start_y"]), (row["end_x"], row["end_y"])]
+                    isPointIntersection = self.__is_point_intersection(intersection, rowPoints, threshold)
+                    edgeAttributes = self.__edge_attributes.copy()
+                    edgeAttributes["point_intersection"] = 1 if isPointIntersection else 0
+                    edgeAttributes["segment_intersection"] = 0 if isPointIntersection else 1
+                    edgeAttributes["angle_difference"] = minAngleDifference / (math.pi / 2)
+                    edgeAttributes["angle_difference_sin"] = math.sin(angleDifference)
+                    edgeAttributes["angle_difference_cos"] = math.cos(angleDifference)
+                    self.edges.append((a, b))
+                    self.edgesAttributes.append(list(edgeAttributes.values()))
         
-        # Step 5: Second pass: Add edges with normalized angleDifference
-        for i, j, intersection, angleDifference in intersectionsList:
-            normalizedAngle = (angleDifference - min_angle_difference) / max_min_angle_difference
-            for a, b in [(i, j), (j, i)]:
-                row = self.__dataframe.iloc[a]
-                rowPoints = [(row["start_x"], row["start_y"]), (row["end_x"], row["end_y"])]
-                pointIntersection = self.__point_intersection(intersection, rowPoints, threshold)
-                edgeAttributes = self.__edge_attributes.copy()
-                edgeAttributes["point_intersection"] = 1 if pointIntersection else 0
-                edgeAttributes["segment_intersection"] = 0 if pointIntersection else 1
-                edgeAttributes["angle_difference"] = normalizedAngle
-                self.edges.append((a, b))
-                self.edgesAttributes.append(list(edgeAttributes.values()))
-        
-        # Step 5: circle-line perimeter intersections
+        # Step 6: circle-line perimeter intersections
         for i, circularElement in geometryCircular:
             nearbyLines = space2D.query(circularElement)
             
@@ -262,7 +263,7 @@ class Graph:
                 
                 row = self.__dataframe.iloc[j]
                 rowPoints = [(row["start_x"], row["start_y"]), (row["end_x"], row["end_y"])] 
-                pointIntersection = self.__point_intersection(intersection, rowPoints, threshold)
+                isPointIntersection = self.__is_point_intersection(intersection, rowPoints, threshold)
                 
                 edgeAttributes = self.__edge_attributes.copy()
                 edgeAttributes["perimeter_intersection"] = 1
@@ -270,8 +271,8 @@ class Graph:
                 self.edgesAttributes.append(list(edgeAttributes.values()))
                 
                 edgeAttributes = self.__edge_attributes.copy()
-                edgeAttributes["point_intersection"] = 1 if pointIntersection else 0
-                edgeAttributes["segment_intersection"] = 0 if pointIntersection else 1
+                edgeAttributes["point_intersection"] = 1 if isPointIntersection else 0
+                edgeAttributes["segment_intersection"] = 0 if isPointIntersection else 1
                 self.edges.append((j, i))
                 self.edgesAttributes.append(list(edgeAttributes.values()))
                          
@@ -326,10 +327,10 @@ def CreateGraph(dxf_file):
         layer = line.dxf.layer
         
         length = math.hypot(end_x - start_x, end_y - start_y)
-        angle = math.atan2(end_y - start_y, end_x - start_x) % math.pi
+        angle = math.atan2(end_y - start_y, end_x - start_x) % (2*math.pi)
         
         nlen = math.hypot(start_y - end_y, end_x - start_x)
-        offset = 0.0 if nlen < 1e-12 else abs(start_x * ((start_y - end_y) / nlen) + start_y * ((end_x - start_x) / nlen))
+        offset = 0.0 if nlen < 1e-12 else start_x * ((start_y - end_y) / nlen) + start_y * ((end_x - start_x) / nlen)
         
         dataframe.append(
             {
@@ -419,8 +420,8 @@ import os
 from tqdm import tqdm
 from multiprocessing import Pool
 
-class GraphDataset(torch.utils.data.Dataset):
-    def __init__(self, dxf_files, CreateGraph=CreateGraph, chunksize=4):
+class CreateGraphDataset(torch.utils.data.Dataset):
+    def __init__(self, dxf_files, chunksize=4):
         self.graphs = []
         with Pool(processes=os.cpu_count()) as pool:
             for graph in tqdm(pool.imap_unordered(CreateGraph, dxf_files, chunksize=chunksize), total=len(dxf_files), desc="Creating graphs"):

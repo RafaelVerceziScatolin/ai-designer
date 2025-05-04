@@ -1,6 +1,8 @@
 from typing import List, Tuple
 import math
-import numpy
+import cupy
+from collections import defaultdict
+from torch.utils.dlpack import from_dlpack
 from scipy.spatial import cKDTree
 from shapely.strtree import STRtree
 from shapely.geometry import LineString, Point
@@ -22,24 +24,50 @@ class Graph:
     def __init__(self, dataframe):
         self.__dataframe = dataframe
         
-        coordinates_x = dataframe[['start_x', 'end_x']]
-        coordinates_y = dataframe[['start_y', 'end_y']]
-        normalizedCoordinates = dataframe[['start_x', 'start_y', 'end_x', 'end_y']].copy()
-        normalizedCoordinates[['start_x', 'end_x']] = (coordinates_x - coordinates_x.values.mean()) / coordinates_x.values.std()
-        normalizedCoordinates[['start_y', 'end_y']] = (coordinates_y - coordinates_y.values.mean()) / coordinates_y.values.std()
+        start_x, start_y = dataframe['start_x'], dataframe['start_y']
+        end_x, end_y = dataframe['end_x'], dataframe['end_y']
+        length = dataframe['length']
+        angle = dataframe['angle']
+        circle = dataframe['circle']
+        arc = dataframe['arc']
         
-        normalizedAngles = numpy.column_stack((numpy.sin(dataframe['angle']), numpy.cos(dataframe['angle']))) 
-        normalizedLengths = dataframe[['length']] / dataframe["length"].max()
-        circleFlags = dataframe[['circle']].values
-        arcFlags = dataframe[['arc']].values
+        # Normalize coordinates
+        coordinates_x = cupy.concatenate([start_x.to_cupy(), end_x.to_cupy()])
+        coordinates_y = cupy.concatenate([start_y.to_cupy(), end_y.to_cupy()])
         
-        self.classificationLabels = dataframe['layer'].map({"beam": 0, "column": 1, "eave": 2,
-                                                            "slab_hole": 3, "stair": 4, "section": 5,
-                                                            "info": 6}).values if "layer" in dataframe.columns else None
-        self.nodesAttributes = numpy.hstack([normalizedCoordinates.values, normalizedAngles, normalizedLengths.values, circleFlags, arcFlags])
+        normalized_start_x = (start_x - coordinates_x.mean()) / coordinates_x.std()
+        normalized_start_y = (start_y - coordinates_y.mean()) / coordinates_y.std()
+        normalized_end_x = (end_x - coordinates_x.mean()) / coordinates_x.std()
+        normalized_end_y = (end_y - coordinates_y.mean()) / coordinates_y.std()
+        
+        normalizedCoordinates = cupy.stack([normalized_start_x.to_cupy(), normalized_start_y.to_cupy(),
+                                            normalized_end_x.to_cupy(), normalized_end_y.to_cupy()], axis=1)
+        
+        # Normalize angles and lengths
+        normalizedAngles = cupy.stack([cupy.sin(angle.to_cupy()), cupy.cos(angle.to_cupy())], axis=1)
+        normalizedLengths = (length / length.max()).to_cupy().reshape(-1, 1)
+        
+        # Flags
+        circleFlags = circle.to_cupy().reshape(-1, 1)
+        arcFlags = arc.to_cupy().reshape(-1, 1)
+        
+        # Classification labels
+        self.classificationLabels = (dataframe['layer']
+            .map({"beam": 0, "column": 1, "eave": 2, "slab_hole": 3, "stair": 4, "section": 5, "info": 6})
+            .to_cupy() if "layer" in dataframe.columns else None)
+        
+        # Node attributes
+        self.nodeAttributes = from_dlpack(cupy.hstack([
+            normalizedCoordinates,
+            normalizedAngles,
+            normalizedLengths,
+            circleFlags,
+            arcFlags
+        ]).toDlpack())
+        
         self.edges: List[Tuple[int, int]] = []
-        self.edgesAttributes: List[List[float]] = []
-    
+        self.edgeAttributes: List[List[float]] = []
+           
     @staticmethod
     def __overlap_ratios(lineA, lineB):
         xA1, yA1, xA2, yA2, lengthA = lineA[['start_x', 'start_y', 'end_x', 'end_y', 'length']]
@@ -118,46 +146,69 @@ class Graph:
             points.append((px, py))
         return points
 
-    def ParallelDetection(self, max_threshold=50, colinear_threshold=0.5, min_overlap_ratio=0.2, angle_tolerance=numpy.radians(0.01)):
+    @staticmethod
+    def __create_bins(dataframe, angle_size, offset_size):
+        # Bin keys for each line
+        angleBins = numpy.floor((dataframe['angle'] % numpy.pi) / angle_size).astype(int)
+        offsetBins = numpy.floor(dataframe['offset'] / offset_size).astype(int)
+        bins = defaultdict(list)
+        for i, (angle, offset) in enumerate(zip(angleBins, offsetBins)):
+            bins[(angle, offset)].append(i)
+        return bins
+        
+    def ParallelDetection(self, max_threshold=50, colinear_threshold=0.5, min_overlap_ratio=0.2,
+                          angle_tolerance=numpy.radians(0.01), bin_angle_size=numpy.radians(0.25)):
         dataframe = self.__dataframe.copy()
         dataframe['angle'] = dataframe['angle'] % math.pi  # collapse symmetrical directions
         
-        # create the 2D space for parallel detection
-        space2D = cKDTree(dataframe[['angle', 'offset']].values)
+        bins = self.__create_bins(dataframe, bin_angle_size, max_threshold)
         
-        # Query for nearby parallel lines in (angle, offset) space
-        for i in range(len(dataframe)):
-            line_i = dataframe.iloc[i]
-            if line_i['circle'] or line_i['arc']: continue
+        # Include neighboring bins for robustness
+        for (angle, offset), i in bins.items():
+            neighboringBins = [(angle + da, offset + do) for da in (-1, 0, 1) for do in (-1, 0, 1)]
+        
+            lineIndexes: List[int] = []
+            for bin in neighboringBins:
+                lineIndexes.extend(bins.get(bin, []))
             
-            angle_i, offset_i = dataframe[['angle', 'offset']].values[i]
-            nearbyLines = space2D.query_ball_point([angle_i, offset_i], r=max_threshold)
+            if len(lineIndexes) < 2: continue
             
-            for j in nearbyLines:
-                if i >= j: continue
+            subset = dataframe.iloc[lineIndexes].reset_index(drop=True)
+            space2D = cKDTree(subset[['angle', 'offset']].values)
+        
+            # Query for nearby parallel lines in (angle, offset) space
+            for i in range(len(subset)):
+                line_i = subset.iloc[i]
+                if line_i['circle'] or line_i['arc']: continue
                 
-                line_j = dataframe.iloc[j]
-                if line_j['circle'] or line_j['arc']: continue
+                angle_i, offset_i = subset[['angle', 'offset']].values[i]
+                nearbyLines = space2D.query_ball_point([angle_i, offset_i], r=max_threshold)
                 
-                overlapA, overlapB = self.__overlap_ratios(line_i, line_j)
-                if min(overlapA, overlapB) <= min_overlap_ratio: continue
-                
-                angle_j, offset_j = dataframe[['angle', 'offset']].values[j]
-                if abs(angle_i - angle_j) >= angle_tolerance: continue
-                
-                # perpendicular distance between the two parallel lines
-                distance = abs(offset_j - offset_i) / numpy.cos(angle_i)
-                
-                # Assign normalized distances to edges
-                for (a, b, overlapRatio) in [(i, j, overlapA), (j, i, overlapB)]:
-                    edgeAttributes = self.__edge_attributes.copy()
-                    edgeAttributes["parallel"] = 1
-                    edgeAttributes["colinear"] = 1 if distance < colinear_threshold else 0
-                    edgeAttributes["perpendicular_distance"] = distance / dataframe["length"].max()
-                    edgeAttributes["overlap_ratio"] = overlapRatio
-                    self.edges.append((a, b))
-                    self.edgesAttributes.append(list(edgeAttributes.values()))
-                
+                for j in nearbyLines:
+                    if i >= j: continue
+                    
+                    line_j = subset.iloc[j]
+                    if line_j['circle'] or line_j['arc']: continue
+                    
+                    overlapA, overlapB = self.__overlap_ratios(line_i, line_j)
+                    if min(overlapA, overlapB) <= min_overlap_ratio: continue
+                    
+                    angle_j, offset_j = subset[['angle', 'offset']].values[j]
+                    if abs(angle_i - angle_j) >= angle_tolerance: continue
+                    
+                    # perpendicular distance between the two parallel lines
+                    distance = abs(offset_j - offset_i) / numpy.cos(angle_i)
+                    
+                    # Assign normalized distances to edges
+                    for (a, b, overlapRatio) in [(i, j, overlapA), (j, i, overlapB)]:
+                        edgeAttributes = self.__edge_attributes.copy()
+                        edgeAttributes["parallel"] = 1
+                        edgeAttributes["colinear"] = 1 if distance < colinear_threshold else 0
+                        edgeAttributes["perpendicular_distance"] = distance / dataframe["length"].max()
+                        edgeAttributes["overlap_ratio"] = overlapRatio
+                        self.edges.append((lineIndexes[a], lineIndexes[b]))
+                        self.edgeAttributes.append(list(edgeAttributes.values()))
+                             
     def IntersectionDetection(self, threshold=0.5, co_linear_tolerance=numpy.radians(0.01)):
         # Step 1: Separate lines vs circles
         geometryCircular: List[Tuple[int, LineString]] = []
@@ -227,7 +278,7 @@ class Graph:
                     edgeAttributes["angle_difference_sin"] = math.sin(angleDifference)
                     edgeAttributes["angle_difference_cos"] = math.cos(angleDifference)
                     self.edges.append((a, b))
-                    self.edgesAttributes.append(list(edgeAttributes.values()))
+                    self.edgeAttributes.append(list(edgeAttributes.values()))
         
         # Step 6: circle-line perimeter intersections
         for i, circularElement in geometryCircular:
@@ -257,13 +308,13 @@ class Graph:
                 edgeAttributes = self.__edge_attributes.copy()
                 edgeAttributes["perimeter_intersection"] = 1
                 self.edges.append((i, j))
-                self.edgesAttributes.append(list(edgeAttributes.values()))
+                self.edgeAttributes.append(list(edgeAttributes.values()))
                 
                 edgeAttributes = self.__edge_attributes.copy()
                 edgeAttributes["point_intersection"] = 1 if isPointIntersection else 0
                 edgeAttributes["segment_intersection"] = 0 if isPointIntersection else 1
                 self.edges.append((j, i))
-                self.edgesAttributes.append(list(edgeAttributes.values()))
+                self.edgeAttributes.append(list(edgeAttributes.values()))
                          
 from torch_geometric.utils import to_scipy_sparse_matrix
 from scipy.sparse import csgraph
@@ -297,7 +348,7 @@ def LaplacianEigenvectors(graph, k=2):
 from typing import Dict
 import ezdxf
 import torch
-import pandas
+import cudf
 from torch_geometric.data import Data
 
 def CreateGraph(dxf_file):
@@ -318,9 +369,6 @@ def CreateGraph(dxf_file):
         length = math.hypot(end_x - start_x, end_y - start_y)
         angle = math.atan2(end_y - start_y, end_x - start_x) % (2*math.pi)
         
-        nlen = math.hypot(start_y - end_y, end_x - start_x)
-        offset = 0.0 if nlen < 1e-12 else abs(start_x * ((start_y - end_y) / nlen) + start_y * ((end_x - start_x) / nlen))
-        
         dataframe.append(
             {
                 "start_x": start_x,
@@ -329,7 +377,6 @@ def CreateGraph(dxf_file):
                 "end_y": end_y,
                 "length": length,
                 "angle": angle,
-                "offset": offset,
                 "layer": layer,
                 "circle": 0,
                 "arc": 0,
@@ -353,7 +400,6 @@ def CreateGraph(dxf_file):
                 "end_y": center_y,
                 "length": perimeter,
                 "angle": 0.0,
-                "offset": 0.0,
                 "layer": layer,
                 "circle": 1,
                 "arc": 0,
@@ -379,7 +425,6 @@ def CreateGraph(dxf_file):
                 "end_y": center_y,
                 "length": arcLength,
                 "angle": 0.0,
-                "offset": 0.0,
                 "layer": layer,
                 "circle": 0,
                 "arc": 1,
@@ -389,20 +434,41 @@ def CreateGraph(dxf_file):
             }
         )
     
-    dataframe = pandas.DataFrame(dataframe)
+    dataframe = cudf.DataFrame(dataframe)
     
+    # Define anchor point
+    anchor_x = cupy.float32(cupy.concatenate([dataframe['start_x'].to_cupy(), dataframe['end_x'].to_cupy()]).min() - 100000)
+    anchor_y = cupy.float32(cupy.concatenate([dataframe['start_y'].to_cupy(), dataframe['end_y'].to_cupy()]).min() - 100000)
+    
+    # Compute offset
+    start_x, start_y, end_x, end_y = dataframe['start_x'], dataframe['start_y'], dataframe['end_x'], dataframe['end_y']
+    
+    # Set a safe length (to avoid division by zero)
+    mask = (dataframe["circle"] == 0) & (dataframe["arc"] == 0) & dataframe["length"] > 1e-12
+    length = dataframe["length"].where(mask, 1.0)
+    
+    # Perpendicular offset (same formula, but mask invalid ones to zero)
+    offset = cupy.abs((start_x - anchor_x) * (-(end_y - start_y) / length) +
+                      (start_y - anchor_y) * ((end_x - start_x) / length))
+    
+    # Apply masking: invalid offsets get zero
+    offset = cupy.where(mask.to_cupy(), offset, 0.0)
+    
+    # Assign back
+    dataframe["offset"] = offset
+        
     graph = Graph(dataframe)
     graph.ParallelDetection()
     graph.IntersectionDetection()
     
     graph.classificationLabels = torch.tensor(graph.classificationLabels, dtype=torch.long)
-    graph.nodesAttributes = torch.tensor(graph.nodesAttributes, dtype=torch.float)
+    graph.nodeAttributes = torch.tensor(graph.nodeAttributes, dtype=torch.float)
     graph.edges = torch.tensor(graph.edges, dtype=torch.long).t().contiguous()
-    graph.edgesAttributes = torch.tensor(graph.edgesAttributes, dtype=torch.float)
+    graph.edgeAttributes = torch.tensor(graph.edgeAttributes, dtype=torch.float)
     
-    graph = Data(x=graph.nodesAttributes, edge_index=graph.edges, edge_attr=graph.edgesAttributes, y=graph.classificationLabels)
+    graph = Data(x=graph.nodeAttributes, edge_index=graph.edges, edge_attr=graph.edgeAttributes, y=graph.classificationLabels)
+    
     #graph: Data = LaplacianEigenvectors(graph)
-    
     return graph
 
 import os

@@ -34,8 +34,9 @@ width_factors = (0.8, 1.0, 1.2)
 rotations= [i * 15 for i in range(24)]
 scales = [0.5*i for i in range(14, 60)] + [5*i for i in range(6, 21)]
 
-import numpy
 from typing import List, Tuple
+import cupy
+from torch.utils.dlpack import from_dlpack
 from .orguel_ml import Graph as BaseGraph
 
 class Graph(BaseGraph):
@@ -54,44 +55,60 @@ class Graph(BaseGraph):
     def __init__(self, dataframe, normalization_factor):
         self.__dataframe = dataframe
         
-        coordinates_x = dataframe[['start_x', 'end_x', 'character_insertion_x']].values.flatten()
-        coordinates_y = dataframe[['start_y', 'end_y', 'character_insertion_y']].values.flatten()
+        character_height = dataframe['character_height']
+        character_width = dataframe['character_width']
+        character_insertion_x = dataframe['character_insertion_x']
+        character_insertion_y = dataframe['character_insertion_y']
+        start_x, start_y = dataframe['start_x'], dataframe['start_y']
+        end_x, end_y = dataframe['end_x'], dataframe['end_y']
+        length = dataframe['length']
+        angle = dataframe['angle']
         
-        normalizedCoordinates = dataframe[['start_x', 'start_y', 'end_x', 'end_y']].copy()
-        normalizedCoordinates[['start_x', 'end_x']] = (normalizedCoordinates[['start_x', 'end_x']] - coordinates_x.values.mean()) / coordinates_x.values.std()
-        normalizedCoordinates[['start_y', 'end_y']] = (normalizedCoordinates[['start_y', 'end_y']] - coordinates_y.values.mean()) / coordinates_y.values.std()
+        # Normalize coordinates
+        coordinates_x = cupy.concatenate(start_x.to_cupy(), end_x.to_cupy(), character_insertion_x.to_cupy())
+        coordinates_y = cupy.concatenate(start_y.to_cupy(), end_y.to_cupy(), character_insertion_y.to_cupy())
         
-        normalizedAngles = numpy.column_stack((numpy.sin(dataframe['angle']), numpy.cos(dataframe['angle'])))
+        normalized_start_x = (start_x - coordinates_x.mean()) / coordinates_x.std()
+        normalized_start_y = (start_y - coordinates_y.mean()) / coordinates_y.std()
+        normalized_end_x = (end_x - coordinates_x.mean()) / coordinates_x.std()
+        normalized_end_y = (end_y - coordinates_y.mean()) / coordinates_y.std()
         
+        normalizedCoordinates = cupy.stack([normalized_start_x.to_cupy(), normalized_start_y.to_cupy(),
+                                            normalized_end_x.to_cupy(), normalized_end_y.to_cupy()], axis=1)
+        
+        # Normalize angles
+        normalizedAngles = cupy.stack([cupy.sin(angle.to_cupy()), cupy.cos(angle.to_cupy())], axis=1)
+        
+        # Normalize length and character dimensions
         if normalization_factor: normalizationFactor = normalization_factor
-        else: normalizationFactor = dataframe[['length', 'character_height', 'character_width']].values.max()
-          
-        normalizedLengths = dataframe[['length']] / normalizationFactor
-        normalizedCharacterHeigth = dataframe[['character_height']] / normalizationFactor
-        normalizedCharacterWidth = dataframe[['character_width']] / normalizationFactor
+        else: normalizationFactor = cupy.max(cupy.stack([length.to_cupy(), character_height.to_cupy(), character_width.to_cupy()], axis=1))
+        
+        normalizedLengths = (length / normalizationFactor).to_cupy().reshape(-1, 1)
+        normalizedCharacterHeigth = (character_height / normalizationFactor)
+        normalizedCharacterWidth = (character_width / normalizationFactor)
         
         characters = dataframe.groupby("character_id")
         
         self.classificationLabels = {
-            "type": characters['character_type'].first().values,
-            "font": characters['character_font'].first().values
+            "type": from_dlpack(characters['character_type'].first().to_cupy().toDlpack()),
+            "font": from_dlpack(characters['character_font'].first().to_cupy().toDlpack())
         }
         
         self.regressionTargets = {
-            "height": normalizedCharacterHeigth.groupby(dataframe['character_id']).first().values,
-            "width": normalizedCharacterWidth.groupby(dataframe['character_id']).first().values,
-            "rotation": characters['character_rotation'].first().values,
-            "insertion_x": ((characters['character_insertion_x'].first() - coordinates_x.values.mean()) / coordinates_x.values.std()).values,
-            "insertion_y": ((characters['character_insertion_y'].first() - coordinates_y.values.mean()) / coordinates_y.values.std()).values
+            "height": from_dlpack(normalizedCharacterHeigth.groupby(dataframe['character_id']).first().to_cupy().toDlpack()),
+            "width": from_dlpack(normalizedCharacterWidth.groupby(dataframe['character_id']).first().to_cupy().toDlpack()),
+            "rotation": from_dlpack(characters['character_rotation'].first().to_cupy().toDlpack()),
+            "insertion_x": from_dlpack(((characters['character_insertion_x'].first() - coordinates_x.mean()) / coordinates_x.std()).to_cupy().toDlpack()),
+            "insertion_y": from_dlpack(((characters['character_insertion_y'].first() - coordinates_y.mean()) / coordinates_y.std()).to_cupy().toDlpack())
         }
         
-        self.nodesAttributes = numpy.hstack([normalizedCoordinates.values, normalizedAngles, normalizedLengths.values])
+        self.nodeAttributes = from_dlpack(cupy.hstack([normalizedCoordinates, normalizedAngles, normalizedLengths]).toDlpack())
         self.edges: List[Tuple[int, int]] = []
-        self.edgesAttributes: List[List[float]] = []
-
+        self.edgeAttributes: List[List[float]] = []
+           
 from typing import Dict
 import math
-import pandas
+import cudf
 import ezdxf
 import torch
 from torch_geometric.data import Data
@@ -129,13 +146,12 @@ def CreateGraph(dxf_file, character_positions, rotation=0, scale=1.0, normalizat
     polygons = list(characterPositions['bbox'])
     space2D = STRtree(polygons)
     polygonToRow = {id(polygon): row for _, row in characterPositions.iterrows() for polygon in [row['bbox']]}
-
+    
     doc = ezdxf.readfile(dxf_file)
     modelSpace = doc.modelspace()
     lineCollector = [line for line in modelSpace if line.dxftype() == 'LINE']
 
     dataframe: List[Dict] = []
-
     for line in lineCollector:
         start_x, start_y, _ = line.dxf.start
         end_x, end_y, _ = line.dxf.end
@@ -148,9 +164,6 @@ def CreateGraph(dxf_file, character_positions, rotation=0, scale=1.0, normalizat
 
         length = math.hypot(end_x - start_x, end_y - start_y)
         angle = math.atan2(end_y - start_y, end_x - start_x) % (2*math.pi)
-
-        nlen = math.hypot(start_y - end_y, end_x - start_x)
-        offset = 0.0 if nlen < 1e-12 else abs(start_x * ((start_y - end_y) / nlen) + start_y * ((end_x - start_x) / nlen))
 
         label = {
             "character_id": 0,
@@ -167,7 +180,6 @@ def CreateGraph(dxf_file, character_positions, rotation=0, scale=1.0, normalizat
             "end_y": end_y,
             "length": length,
             "angle": angle,
-            "offset": offset,
             "circle": 0,
             "arc": 0,
             "radius": 0,
@@ -196,10 +208,32 @@ def CreateGraph(dxf_file, character_positions, rotation=0, scale=1.0, normalizat
 
         dataframe.append(label)
 
-    dataframe = pandas.DataFrame(dataframe)
+    dataframe = cudf.DataFrame(dataframe)
+    
+    # Define anchor point
+    anchor_x = cupy.float32(cupy.concatenate([dataframe['start_x'].to_cupy(), dataframe['end_x'].to_cupy()]).min() - 100000)
+    anchor_y = cupy.float32(cupy.concatenate([dataframe['start_y'].to_cupy(), dataframe['end_y'].to_cupy()]).min() - 100000)
+    
+    # Compute offset
+    start_x, start_y, end_x, end_y = dataframe['start_x'], dataframe['start_y'], dataframe['end_x'], dataframe['end_y']
+    
+    # Set a safe length (to avoid division by zero)
+    mask = (dataframe["circle"] == 0) & (dataframe["arc"] == 0) & dataframe["length"] > 1e-12
+    length = dataframe["length"].where(mask, 1.0)
+    
+    # Perpendicular offset (same formula, but mask invalid ones to zero)
+    offset = cupy.abs((start_x - anchor_x) * (-(end_y - start_y) / length) +
+                      (start_y - anchor_y) * ((end_x - start_x) / length))
+    
+    # Apply masking: invalid offsets get zero
+    offset = cupy.where(mask.to_cupy(), offset, 0.0)
+    
+    # Assign back
+    dataframe["offset"] = offset
     
     graph = Graph(dataframe, normalization_factor)
-    graph.ParallelDetection()
+    
+    graph.ParallelDetection(max_threshold=7.5, bin_angle_size=numpy.radians(0.25))
     graph.IntersectionDetection()
     
     graph.classificationLabels = {
@@ -215,15 +249,15 @@ def CreateGraph(dxf_file, character_positions, rotation=0, scale=1.0, normalizat
         "insertion_y": torch.tensor(graph.regressionTargets["insertion_y"], dtype=torch.float)
     }
     
-    graph.nodesAttributes = torch.tensor(graph.nodesAttributes, dtype=torch.float)
+    graph.nodeAttributes = torch.tensor(graph.nodeAttributes, dtype=torch.float)
     graph.edges = torch.tensor(graph.edges, dtype=torch.long).t().contiguous()
-    graph.edgesAttributes = torch.tensor(graph.edgesAttributes, dtype=torch.float)
+    graph.edgeAttributes = torch.tensor(graph.edgeAttributes, dtype=torch.float)
     
     # Create PyG Data object with everything
     graph = Data(
-        x=graph.nodesAttributes,
+        x=graph.nodeAttributes,
         edge_index=graph.edges,
-        edge_attr=graph.edgesAttributes,
+        edge_attr=graph.edgeAttributes,
         y=graph.classificationLabels["type"],
         font=graph.classificationLabels["font"],
         height=graph.regressionTargets["height"],
@@ -231,28 +265,32 @@ def CreateGraph(dxf_file, character_positions, rotation=0, scale=1.0, normalizat
         rotation=graph.regressionTargets["rotation"],
         insertion_x=graph.regressionTargets["insertion_x"],
         insertion_y=graph.regressionTargets["insertion_y"],
-        cluster_id=torch.tensor(dataframe["character_id"].values, dtype=torch.long)
+        character_id=torch.tensor(dataframe["character_id"].values, dtype=torch.long)
     )
     
-    graph: Data = LaplacianEigenvectors(graph, k=4)
-    
-    return dataframe
+    #graph: Data = LaplacianEigenvectors(graph, k=4)
+
+    return graph
 
 import os
 from tqdm import tqdm
 from multiprocessing import Pool
 
-def __create_graph_worker(args):
+def CreateGraphWorker(args):
+    print(f"[DEBUG] Calling CreateGraph with: {args[0]}")
     return CreateGraph(*args)
 
 class CreateGraphDataset(torch.utils.data.Dataset):
     def __init__(self, arguments, chunksize=4):
         self.graphs = []
-        with Pool(processes=os.cpu_count()) as pool:
-            for graph in tqdm(pool.imap_unordered(__create_graph_worker, arguments, chunksize=chunksize),
-                              total=len(arguments),
-                              desc="Creating graphs"):
-                self.graphs.append(graph)
+        #with Pool(processes=os.cpu_count()) as pool:
+            #for graph in tqdm(pool.imap_unordered(CreateGraphWorker, arguments, chunksize=chunksize),
+            #                  total=len(arguments),
+            #                  desc="Creating graphs"):
+            #    self.graphs.append(graph)
+        for args in tqdm(arguments, desc="Creating graphs"): #DEBUG
+            print(f"Processing: {args[0]}") #DEBUG
+            self.graphs.append(CreateGraphWorker(args)) #DEBUG
     
     def __len__(self):
         return len(self.graphs)
