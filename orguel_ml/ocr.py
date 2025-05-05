@@ -73,19 +73,19 @@ class Graph(BaseGraph):
         normalized_end_x = (end_x - coordinates_x.mean()) / coordinates_x.std()
         normalized_end_y = (end_y - coordinates_y.mean()) / coordinates_y.std()
         
-        normalizedCoordinates = cupy.stack([normalized_start_x.to_cupy(), normalized_start_y.to_cupy(),
+        normalized_coordinates = cupy.stack([normalized_start_x.to_cupy(), normalized_start_y.to_cupy(),
                                             normalized_end_x.to_cupy(), normalized_end_y.to_cupy()], axis=1)
         
         # Normalize angles
-        normalizedAngles = cupy.stack([cupy.sin(angle.to_cupy()), cupy.cos(angle.to_cupy())], axis=1)
+        normalized_angles = cupy.stack([cupy.sin(angle.to_cupy()), cupy.cos(angle.to_cupy())], axis=1)
         
         # Normalize length and character dimensions
         if normalization_factor: normalizationFactor = normalization_factor
         else: normalizationFactor = cupy.max(cupy.stack([length.to_cupy(), character_height.to_cupy(), character_width.to_cupy()], axis=1))
         
-        normalizedLengths = (length / normalizationFactor).to_cupy().reshape(-1, 1)
-        normalizedCharacterHeigth = (character_height / normalizationFactor)
-        normalizedCharacterWidth = (character_width / normalizationFactor)
+        normalized_lengths = (length / normalizationFactor).to_cupy().reshape(-1, 1)
+        normalized_character_heigth = (character_height / normalizationFactor)
+        normalized_character_width = (character_width / normalizationFactor)
         
         characters = dataframe.groupby("character_id")
         
@@ -95,14 +95,14 @@ class Graph(BaseGraph):
         }
         
         self.regressionTargets = {
-            "height": from_dlpack(normalizedCharacterHeigth.groupby(dataframe['character_id']).first().to_cupy().toDlpack()),
-            "width": from_dlpack(normalizedCharacterWidth.groupby(dataframe['character_id']).first().to_cupy().toDlpack()),
+            "height": from_dlpack(normalized_character_heigth.groupby(dataframe['character_id']).first().to_cupy().toDlpack()),
+            "width": from_dlpack(normalized_character_width.groupby(dataframe['character_id']).first().to_cupy().toDlpack()),
             "rotation": from_dlpack(characters['character_rotation'].first().to_cupy().toDlpack()),
             "insertion_x": from_dlpack(((characters['character_insertion_x'].first() - coordinates_x.mean()) / coordinates_x.std()).to_cupy().toDlpack()),
             "insertion_y": from_dlpack(((characters['character_insertion_y'].first() - coordinates_y.mean()) / coordinates_y.std()).to_cupy().toDlpack())
         }
         
-        self.nodeAttributes = from_dlpack(cupy.hstack([normalizedCoordinates, normalizedAngles, normalizedLengths]).toDlpack())
+        self.nodeAttributes = from_dlpack(cupy.hstack([normalized_coordinates, normalized_angles, normalized_lengths]).toDlpack())
         self.edges: List[Tuple[int, int]] = []
         self.edgeAttributes: List[List[float]] = []
            

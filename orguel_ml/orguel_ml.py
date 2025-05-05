@@ -40,16 +40,16 @@ class Graph:
         normalized_end_x = (end_x - coordinates_x.mean()) / coordinates_x.std()
         normalized_end_y = (end_y - coordinates_y.mean()) / coordinates_y.std()
         
-        normalizedCoordinates = cupy.stack([normalized_start_x.to_cupy(), normalized_start_y.to_cupy(),
+        normalized_coordinates = cupy.stack([normalized_start_x.to_cupy(), normalized_start_y.to_cupy(),
                                             normalized_end_x.to_cupy(), normalized_end_y.to_cupy()], axis=1)
         
         # Normalize angles and lengths
-        normalizedAngles = cupy.stack([cupy.sin(angle.to_cupy()), cupy.cos(angle.to_cupy())], axis=1)
-        normalizedLengths = (length / length.max()).to_cupy().reshape(-1, 1)
+        normalized_angles = cupy.stack([cupy.sin(angle.to_cupy()), cupy.cos(angle.to_cupy())], axis=1)
+        normalized_lengths = (length / length.max()).to_cupy().reshape(-1, 1)
         
         # Flags
-        circleFlags = circle.to_cupy().reshape(-1, 1)
-        arcFlags = arc.to_cupy().reshape(-1, 1)
+        circle_flags = circle.to_cupy().reshape(-1, 1)
+        arc_flags = arc.to_cupy().reshape(-1, 1)
         
         # Classification labels
         self.classificationLabels = (dataframe['layer']
@@ -58,11 +58,11 @@ class Graph:
         
         # Node attributes
         self.nodeAttributes = from_dlpack(cupy.hstack([
-            normalizedCoordinates,
-            normalizedAngles,
-            normalizedLengths,
-            circleFlags,
-            arcFlags
+            normalized_coordinates,
+            normalized_angles,
+            normalized_lengths,
+            circle_flags,
+            arc_flags
         ]).toDlpack())
         
         self.edges: List[Tuple[int, int]] = []
@@ -162,8 +162,8 @@ class Graph:
         
         # Include neighboring bins for robustness
         for (angle, offset), _ in bins:
-            neighboringBins = [(angle + da, offset + do) for da in (-1, 0, 1) for do in (-1, 0, 1)]
-            neighboringBinsIndexes = [bins.groups[bin] for bin in neighboringBins if bin in bins.groups]
+            neighboring_bins = [(angle + da, offset + do) for da in (-1, 0, 1) for do in (-1, 0, 1)]
+            neighboringBinsIndexes = [bins.groups[bin] for bin in neighboring_bins if bin in bins.groups]
             
             lineIndexes = cupy.concatenate([i.to_cupy() for i in neighboringBinsIndexes])
             
@@ -202,13 +202,17 @@ class Graph:
                         edgeAttributes[self.colinear] = 1 if distance < colinear_threshold else 0
                         edgeAttributes[self.perpendicular_distance] = distance / dataframe["length"].max()
                         edgeAttributes[self.overlap_ratio] = overlapRatio
-                        self.edges.append((lineIndexes[a], lineIndexes[b]))
-                        self.edgeAttributes.append(list(edgeAttributes.values()))
+                        self.edges.append(int((lineIndexes[a]), int(lineIndexes[b])))
+                        self.edgeAttributes.append(edgeAttributes)
                                    
     def IntersectionDetection(self, threshold=0.5, co_linear_tolerance=cupy.radians(0.01)):
         dataframe = self.__dataframe.copy()
         
-        lines = dataframe[(dataframe['circle'] == 0) & (dataframe['arc'] == 0)].reset_index(drop=True)
+        isLine = (df['circle'] == 0) & (df['arc'] == 0)
+        lines = dataframe[isLine].reset_index(drop=True)
+        circular_elements = dataframe[~isLine].reset_index(drop=True)
+        
+        # Create cuSpatial-compatible linestrings
         
         
         
@@ -600,6 +604,7 @@ class Graph:
         df = self.__dataframe.copy()
         is_line = (df['circle'] == 0) & (df['arc'] == 0)
         df_lines = df[is_line].reset_index(drop=True)
+        df_circular = df[~is_line].reset_index(drop=True)
 
         if len(df_lines) < 2:
             return
@@ -624,35 +629,50 @@ class Graph:
         i_indices = result["lhs_index"].to_cupy()
         j_indices = result["rhs_index"].to_cupy()
         intersections = result["point"].copy()
+        
+        angles = df_lines['angle'].to_cupy()
+        start_x = df_lines['start_x'].to_cupy()
+        start_y = df_lines['start_y'].to_cupy()
+        end_x = df_lines['end_x'].to_cupy()
+        end_y = df_lines['end_y'].to_cupy()
 
         for idx in range(len(i_indices)):
-            i, j = int(i_indices[idx]), int(j_indices[idx])
+            i, j = i_indices[idx], j_indices[idx]
             if i >= j:
                 continue
 
-            angle_i = df_lines['angle'].iloc[i]
-            angle_j = df_lines['angle'].iloc[j]
-            minAngleDifference = (angle_j - angle_i) % cupy.pi
-            minAngleDifference = min(minAngleDifference, cupy.pi - minAngleDifference)
-            if minAngleDifference < co_linear_tolerance:
+            angle_i, angle_j = angles[i], angles[j]
+            min_angle_diff = (angle_j - angle_i) % cupy.pi
+            min_angle_diff = cupy.minimum(min_angle_diff, cupy.pi - min_angle_diff)
+            if min_angle_diff < co_linear_tolerance:
                 continue
 
             intersection = intersections.iloc[idx]
-            intersection_point = (intersection.x, intersection.y)
-            angleDifference = (angle_j - angle_i) % (2 * cupy.pi)
+            ix, iy = intersection.x, intersection.y
+            angle_diff = (angle_j - angle_i) % (2 * cupy.pi)
 
             for a, b in [(i, j), (j, i)]:
-                row = df_lines.iloc[a]
-                rowPoints = [(row['start_x'], row['start_y']), (row['end_x'], row['end_y'])]
-                isPoint = self.__is_point_intersection(intersection_point, rowPoints, threshold)
-                attr = cupy.zeros(len(self.__edge_attributes), dtype=cupy.float32)
-                attr[self.point_intersection] = 1 if isPoint else 0
-                attr[self.segment_intersection] = 0 if isPoint else 1
-                attr[self.angle_difference] = minAngleDifference / (cupy.pi / 2)
-                attr[self.angle_difference_sin] = cupy.sin(angleDifference)
-                attr[self.angle_difference_cos] = cupy.cos(angleDifference)
-                self.edges.append((int(df_lines.index[a]), int(df_lines.index[b])))
-                self.edgeAttributes.append(list(attr.tolist()))
+                x1, y1 = start_x[a], start_y[a]
+                x2, y2 = end_x[a], end_y[a]
+                px, py = ix, iy
 
+                # Vectorized point-segment proximity check
+                dot = (px - x1) * (x2 - x1) + (py - y1) * (y2 - y1)
+                len_sq = (x2 - x1)**2 + (y2 - y1)**2
+                param = dot / len_sq if len_sq != 0 else -1
+                xx = x1 + param * (x2 - x1)
+                yy = y1 + param * (y2 - y1)
+                dist = cupy.hypot(px - xx, py - yy)
+                is_point = dist < threshold
+
+                attr = cupy.zeros(len(self.__edge_attributes), dtype=cupy.float32)
+                attr[self.point_intersection] = 1 if is_point else 0
+                attr[self.segment_intersection] = 0 if is_point else 1
+                attr[self.angle_difference] = min_angle_diff / (cupy.pi / 2)
+                attr[self.angle_difference_sin] = cupy.sin(angle_diff)
+                attr[self.angle_difference_cos] = cupy.cos(angle_diff)
+
+                edges.append((int(df_lines.index[a]), int(df_lines.index[b])))
+                edge_attrs.append(attr)
 
 """
