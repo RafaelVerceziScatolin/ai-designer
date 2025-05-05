@@ -40,17 +40,17 @@ from torch.utils.dlpack import from_dlpack
 from .orguel_ml import Graph as BaseGraph
 
 class Graph(BaseGraph):
-    __edge_attributes = {
-                            "parallel": 0,
-                            "colinear": 0,
-                            "perpendicular_distance": 0,
-                            "overlap_ratio": 0,
-                            "point_intersection": 0,
-                            "segment_intersection": 0,
-                            "angle_difference": 0,
-                            "angle_difference_sin": 0,
-                            "angle_difference_cos": 0,
-                        }
+    __edge_attributes = cupy.arange(9, dtype=cupy.int32)
+    
+    parallel = 0
+    colinear = 1
+    perpendicular_distance = 2
+    overlap_ratio = 3
+    point_intersection = 4
+    segment_intersection = 5
+    angle_difference = 6
+    angle_difference_sin = 7
+    angle_difference_cos = 8
     
     def __init__(self, dataframe, normalization_factor):
         self.__dataframe = dataframe

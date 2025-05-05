@@ -1,26 +1,26 @@
 from typing import List, Tuple
 import math
 import cupy
-from collections import defaultdict
 from torch.utils.dlpack import from_dlpack
-from scipy.spatial import cKDTree
+from cupyx.scipy.spatial import cKDTree
 from shapely.strtree import STRtree
 from shapely.geometry import LineString, Point
 from shapely.ops import nearest_points
 
 class Graph:
-    __edge_attributes = {
-                            "parallel": 0,
-                            "colinear": 0,
-                            "perpendicular_distance": 0,
-                            "overlap_ratio": 0,
-                            "point_intersection": 0,
-                            "segment_intersection": 0,
-                            "angle_difference": 0,
-                            "angle_difference_sin": 0,
-                            "angle_difference_cos": 0,
-                            "perimeter_intersection": 0
-                        }
+    __edge_attributes = cupy.arange(10, dtype=cupy.int32)
+    
+    parallel = 0
+    colinear = 1
+    perpendicular_distance = 2
+    overlap_ratio = 3
+    point_intersection = 4
+    segment_intersection = 5
+    angle_difference = 6
+    angle_difference_sin = 7
+    angle_difference_cos = 8
+    perimeter_intersection = 9
+    
     def __init__(self, dataframe):
         self.__dataframe = dataframe
         
@@ -149,67 +149,72 @@ class Graph:
     @staticmethod
     def __create_bins(dataframe, angle_size, offset_size):
         # Bin keys for each line
-        angleBins = numpy.floor((dataframe['angle'] % numpy.pi) / angle_size).astype(int)
-        offsetBins = numpy.floor(dataframe['offset'] / offset_size).astype(int)
-        bins = defaultdict(list)
-        for i, (angle, offset) in enumerate(zip(angleBins, offsetBins)):
-            bins[(angle, offset)].append(i)
-        return bins
+        dataframe['angle_bin'] = cupy.floor((dataframe['angle'] % cupy.pi) / angle_size).astype(cupy.int32)
+        dataframe['offset_bin'] = cupy.floor(dataframe['offset'] / offset_size).astype(cupy.int32)
+        return dataframe.groupby(['angle_bin', 'offset_bin'])
         
     def ParallelDetection(self, max_threshold=50, colinear_threshold=0.5, min_overlap_ratio=0.2,
-                          angle_tolerance=numpy.radians(0.01), bin_angle_size=numpy.radians(0.25)):
+                          angle_tolerance=cupy.radians(0.01), bin_angle_size=cupy.radians(0.25)):
         dataframe = self.__dataframe.copy()
-        dataframe['angle'] = dataframe['angle'] % math.pi  # collapse symmetrical directions
+        dataframe['angle'] = dataframe['angle'] % cupy.pi  # collapse symmetrical directions
         
         bins = self.__create_bins(dataframe, bin_angle_size, max_threshold)
         
         # Include neighboring bins for robustness
-        for (angle, offset), i in bins.items():
+        for (angle, offset), _ in bins:
             neighboringBins = [(angle + da, offset + do) for da in (-1, 0, 1) for do in (-1, 0, 1)]
-        
-            lineIndexes: List[int] = []
-            for bin in neighboringBins:
-                lineIndexes.extend(bins.get(bin, []))
+            neighboringBinsIndexes = [bins.groups[bin] for bin in neighboringBins if bin in bins.groups]
+            
+            lineIndexes = cupy.concatenate([i.to_cupy() for i in neighboringBinsIndexes])
             
             if len(lineIndexes) < 2: continue
             
-            subset = dataframe.iloc[lineIndexes].reset_index(drop=True)
-            space2D = cKDTree(subset[['angle', 'offset']].values)
-        
+            subset = dataframe.take(lineIndexes).reset_index(drop=True)
+            
+            coordinates = cupy.stack([subset['angle'].to_cupy(), subset['offset'].to_cupy()], axis=1)
+            space2D = cKDTree(coordinates)
+            
             # Query for nearby parallel lines in (angle, offset) space
             for i in range(len(subset)):
-                line_i = subset.iloc[i]
-                if line_i['circle'] or line_i['arc']: continue
+                if subset['circle'].iloc[i] or subset['arc'].iloc[i]: continue
                 
-                angle_i, offset_i = subset[['angle', 'offset']].values[i]
+                angle_i, offset_i = subset['angle'].iloc[i], subset['offset'].iloc[i]
                 nearbyLines = space2D.query_ball_point([angle_i, offset_i], r=max_threshold)
                 
                 for j in nearbyLines:
                     if i >= j: continue
+                    if subset['circle'].iloc[j] or subset['arc'].iloc[j]: continue
                     
-                    line_j = subset.iloc[j]
-                    if line_j['circle'] or line_j['arc']: continue
-                    
+                    line_i, line_j = subset.iloc[i], subset.iloc[j]
                     overlapA, overlapB = self.__overlap_ratios(line_i, line_j)
                     if min(overlapA, overlapB) <= min_overlap_ratio: continue
                     
-                    angle_j, offset_j = subset[['angle', 'offset']].values[j]
-                    if abs(angle_i - angle_j) >= angle_tolerance: continue
+                    angle_j = subset['angle'].iloc[j]
+                    if cupy.abs(angle_i - angle_j) >= angle_tolerance: continue
                     
                     # perpendicular distance between the two parallel lines
-                    distance = abs(offset_j - offset_i) / numpy.cos(angle_i)
+                    distance = cupy.abs(subset['offset'].iloc[j] - offset_i) / cupy.cos(angle_i)
                     
                     # Assign normalized distances to edges
                     for (a, b, overlapRatio) in [(i, j, overlapA), (j, i, overlapB)]:
-                        edgeAttributes = self.__edge_attributes.copy()
-                        edgeAttributes["parallel"] = 1
-                        edgeAttributes["colinear"] = 1 if distance < colinear_threshold else 0
-                        edgeAttributes["perpendicular_distance"] = distance / dataframe["length"].max()
-                        edgeAttributes["overlap_ratio"] = overlapRatio
+                        edgeAttributes = cupy.zeros(len(self.__edge_attributes), dtype=cupy.float32)
+                        edgeAttributes[self.parallel] = 1
+                        edgeAttributes[self.colinear] = 1 if distance < colinear_threshold else 0
+                        edgeAttributes[self.perpendicular_distance] = distance / dataframe["length"].max()
+                        edgeAttributes[self.overlap_ratio] = overlapRatio
                         self.edges.append((lineIndexes[a], lineIndexes[b]))
                         self.edgeAttributes.append(list(edgeAttributes.values()))
-                             
-    def IntersectionDetection(self, threshold=0.5, co_linear_tolerance=numpy.radians(0.01)):
+                                   
+    def IntersectionDetection(self, threshold=0.5, co_linear_tolerance=cupy.radians(0.01)):
+        dataframe = self.__dataframe.copy()
+        
+        lines = dataframe[(dataframe['circle'] == 0) & (dataframe['arc'] == 0)].reset_index(drop=True)
+        
+        
+        
+        
+        
+        
         # Step 1: Separate lines vs circles
         geometryCircular: List[Tuple[int, LineString]] = []
         geometryLines: List[Tuple[int, LineString]] = []
@@ -583,3 +588,71 @@ def BalanceClassWeights(dataset, device="cpu", smoothing_factor=0.2, classificat
     class_weights = [(total_samples / (2 * total_class[i])) ** smoothing_factor for i in range(classification_labels)]
     
     return torch.tensor(class_weights, dtype=torch.float).to(device)
+
+
+"""
+import cupy
+import cudf
+import cuspatial
+
+class Graph:
+    def IntersectionDetection(self, threshold=0.5, co_linear_tolerance=cupy.radians(0.01)):
+        df = self.__dataframe.copy()
+        is_line = (df['circle'] == 0) & (df['arc'] == 0)
+        df_lines = df[is_line].reset_index(drop=True)
+
+        if len(df_lines) < 2:
+            return
+
+        # Create cuSpatial-compatible linestrings
+        offsets = cupy.arange(0, len(df_lines) * 2 + 1, 2, dtype=cupy.int32)
+        points_x = cupy.empty(len(df_lines) * 2, dtype=cupy.float32)
+        points_y = cupy.empty(len(df_lines) * 2, dtype=cupy.float32)
+
+        points_x[::2] = df_lines['start_x'].to_cupy()
+        points_y[::2] = df_lines['start_y'].to_cupy()
+        points_x[1::2] = df_lines['end_x'].to_cupy()
+        points_y[1::2] = df_lines['end_y'].to_cupy()
+
+        # Build linestring geometry
+        geometry = cuspatial.GeometryColumn.from_lines(
+            cuspatial.make_linestring(offsets, points_x, points_y)
+        )
+
+        # Compute pairwise intersections
+        result = cuspatial.linestring_intersection(geometry, geometry)
+        i_indices = result["lhs_index"].to_cupy()
+        j_indices = result["rhs_index"].to_cupy()
+        intersections = result["point"].copy()
+
+        for idx in range(len(i_indices)):
+            i, j = int(i_indices[idx]), int(j_indices[idx])
+            if i >= j:
+                continue
+
+            angle_i = df_lines['angle'].iloc[i]
+            angle_j = df_lines['angle'].iloc[j]
+            minAngleDifference = (angle_j - angle_i) % cupy.pi
+            minAngleDifference = min(minAngleDifference, cupy.pi - minAngleDifference)
+            if minAngleDifference < co_linear_tolerance:
+                continue
+
+            intersection = intersections.iloc[idx]
+            intersection_point = (intersection.x, intersection.y)
+            angleDifference = (angle_j - angle_i) % (2 * cupy.pi)
+
+            for a, b in [(i, j), (j, i)]:
+                row = df_lines.iloc[a]
+                rowPoints = [(row['start_x'], row['start_y']), (row['end_x'], row['end_y'])]
+                isPoint = self.__is_point_intersection(intersection_point, rowPoints, threshold)
+                attr = cupy.zeros(len(self.__edge_attributes), dtype=cupy.float32)
+                attr[self.point_intersection] = 1 if isPoint else 0
+                attr[self.segment_intersection] = 0 if isPoint else 1
+                attr[self.angle_difference] = minAngleDifference / (cupy.pi / 2)
+                attr[self.angle_difference_sin] = cupy.sin(angleDifference)
+                attr[self.angle_difference_cos] = cupy.cos(angleDifference)
+                self.edges.append((int(df_lines.index[a]), int(df_lines.index[b])))
+                self.edgeAttributes.append(list(attr.tolist()))
+
+
+"""

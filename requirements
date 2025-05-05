@@ -22,10 +22,12 @@ Linux
 
 conda create -n dl_torch python=3.10
 conda activate dl_torch
-conda install matplotlib scikit-learn tqdm nltk
-conda install -c conda-forge pydotplus ipywidgets mlxtend
-conda install pytorch torchvision torchaudio pytorch-cuda=12.1 -c pytorch -c nvidia
-conda install -c conda-forge pytorch-lightning tensorboard shapely
-conda install pyg -c pyg
+conda install -c rapidsai -c conda-forge -c nvidia cudf=23.12 python=3.10
+conda install -c conda-forge matplotlib scikit-learn tqdm nltk ipywidgets mlxtend pydotplus shapely ezdxf
+conda install -c pytorch -c nvidia pytorch torchvision torchaudio pytorch-cuda=12.1
+conda install -c conda-forge pytorch-lightning tensorboard
+conda install -c pyg pyg
 conda install -c pyg -c conda-forge torch-scatter
 pip install tqdm_joblib
+pip uninstall cupy
+pip install cupy-cuda12x -f https://pip.cupy.dev
