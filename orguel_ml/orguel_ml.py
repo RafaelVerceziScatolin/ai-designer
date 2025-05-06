@@ -1,6 +1,7 @@
 from typing import List, Tuple
 import math
 import cupy
+import cuspatial
 from torch.utils.dlpack import from_dlpack
 from cupyx.scipy.spatial import cKDTree
 from shapely.strtree import STRtree
@@ -208,12 +209,78 @@ class Graph:
     def IntersectionDetection(self, threshold=0.5, co_linear_tolerance=cupy.radians(0.01)):
         dataframe = self.__dataframe.copy()
         
-        isLine = (df['circle'] == 0) & (df['arc'] == 0)
+        isLine = (dataframe['circle'] == 0) & (dataframe['arc'] == 0)
         lines = dataframe[isLine].reset_index(drop=True)
         circular_elements = dataframe[~isLine].reset_index(drop=True)
         
-        # Create cuSpatial-compatible linestrings
+        angle = lines['angle'].to_cupy()
+        start_x = lines['start_x'].to_cupy()
+        start_y = lines['start_y'].to_cupy()
+        end_x = lines['end_x'].to_cupy()
+        end_y = lines['end_y'].to_cupy()
         
+        # Create cuSpatial-compatible linestrings
+        offsetIndexes = cupy.arange(0, len(lines) * 2 + 1, 2, dtype=cupy.int32)
+        coordinates_x = cupy.empty(len(lines) * 2, dtype=cupy.float32)
+        coordinates_y = cupy.empty(len(lines) * 2, dtype=cupy.float32)
+        
+        coordinates_x[::2] = start_x
+        coordinates_y[::2] = start_y
+        coordinates_x[1::2] = end_x
+        coordinates_y[1::2] = end_y
+        
+        # Build linestring geometry
+        geometryLines = cuspatial.GeometryColumn.from_lines(
+            cuspatial.make_linestring(offsetIndexes, coordinates_x, coordinates_y))
+        
+        # Compute pairwise intersections
+        result = cuspatial.linestring_intersection(geometryLines, geometryLines)
+        indexes_line_i = result["lhs_index"].to_cupy()
+        indexes_line_j = result["rhs_index"].to_cupy()
+        intersections_x,  intersections_y = result["x"].copy(), result["y"].copy()
+        
+        for k in range(len(result)):
+            i, j = indexes_line_i[k], indexes_line_j[k]
+            if i >= j: continue # Avoid duplicate processing
+            
+            # Angle check (skip nearly identical lines)
+            angle_i, angle_j = angle[i], angle[j]
+            minAngleDifference = (angle_j - angle_i) % cupy.pi
+            minAngleDifference = cupy.minimum(minAngleDifference, cupy.pi - minAngleDifference)
+            if minAngleDifference < co_linear_tolerance: continue
+            
+            
+            
+            
+            
+            
+            
+            
+            
+            
+            # Check actual intersection
+            px, py = intersections_x[k], intersections_y[k]
+            
+            for a, b in [(i, j), (j, i)]:
+                x1, y1 = start_x[a], start_y[a]
+                x2, y2 = end_x[a], end_y[a]
+                
+                isPointIntersection = self.__is_point_intersection(px, py, x1, y1, x2, y2, threshold)
+                
+
+                # Vectorized point-segment proximity check
+                dot = (px - x1) * (x2 - x1) + (py - y1) * (y2 - y1)
+                len_sq = (x2 - x1)**2 + (y2 - y1)**2
+                param = dot / len_sq if len_sq != 0 else -1
+                xx = x1 + param * (x2 - x1)
+                yy = y1 + param * (y2 - y1)
+                distance = cupy.hypot(px - xx, py - yy)
+                isPoint = distance < threshold
+            
+            
+            
+            
+            
         
         
         
