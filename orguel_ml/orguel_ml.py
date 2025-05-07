@@ -121,13 +121,10 @@ class Graph:
         return overlapAinB, overlapBinA
     
     @staticmethod
-    def __is_point_intersection(intersection, endpoints, threshold):
-        ix, iy = intersection
-        for ex, ey in endpoints:
-            distance = math.dist((ix, iy), (ex, ey))  # Euclidean distance
-            if distance <= threshold:
-                return True
-        return False
+    def __is_point_intersection(self, threshold, ix, iy, x1, y1, x2, y2):
+        d1 = cupy.hypot(ix - x1, iy - y1)
+        d2 = cupy.hypot(ix - x2, iy - y2)
+        return (d1 <= threshold) | (d2 <= threshold)
     
     @staticmethod
     def __create_arc(center, radius, startAngle, endAngle, segments=16):
@@ -233,7 +230,7 @@ class Graph:
         geometryLines = cuspatial.GeometryColumn.from_lines(
             cuspatial.make_linestring(offsetIndexes, coordinates_x, coordinates_y))
         
-        # Compute pairwise intersections
+        # Compute pairwise intersections (projection of the lines)
         result = cuspatial.linestring_intersection(geometryLines, geometryLines)
         indexes_line_i = result["lhs_index"].to_cupy()
         indexes_line_j = result["rhs_index"].to_cupy()
@@ -243,40 +240,30 @@ class Graph:
             i, j = indexes_line_i[k], indexes_line_j[k]
             if i >= j: continue # Avoid duplicate processing
             
+            # Check actual intersection
+            
+            
+            
+            
+            
             # Angle check (skip nearly identical lines)
             angle_i, angle_j = angle[i], angle[j]
             minAngleDifference = (angle_j - angle_i) % cupy.pi
             minAngleDifference = cupy.minimum(minAngleDifference, cupy.pi - minAngleDifference)
             if minAngleDifference < co_linear_tolerance: continue
             
-            
-            
-            
-            
-            
-            
-            
-            
-            
             # Check actual intersection
-            px, py = intersections_x[k], intersections_y[k]
+            intersection_x, intersection_y = intersections_x[k], intersections_y[k]
             
             for a, b in [(i, j), (j, i)]:
-                x1, y1 = start_x[a], start_y[a]
-                x2, y2 = end_x[a], end_y[a]
+               isPointIntersection = self.__is_point_intersection(threshold, 
+                                                intersection_x, intersection_y,
+                                                start_x[a], start_y[a], end_x[a], end_y[a],)
                 
-                isPointIntersection = self.__is_point_intersection(px, py, x1, y1, x2, y2, threshold)
                 
-
-                # Vectorized point-segment proximity check
-                dot = (px - x1) * (x2 - x1) + (py - y1) * (y2 - y1)
-                len_sq = (x2 - x1)**2 + (y2 - y1)**2
-                param = dot / len_sq if len_sq != 0 else -1
-                xx = x1 + param * (x2 - x1)
-                yy = y1 + param * (y2 - y1)
-                distance = cupy.hypot(px - xx, py - yy)
-                isPoint = distance < threshold
-            
+                
+               
+           
             
             
             
