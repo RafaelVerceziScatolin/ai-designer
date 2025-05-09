@@ -145,29 +145,111 @@ class Graph:
         return points
 
     @staticmethod
-    def __create_bins(dataframe, angle_size, offset_size):
+    def __create_bins_angle_offset(dataframe, angle_size, offset_size):
         # Bin keys for each line
         dataframe['angle_bin'] = cupy.floor((dataframe['angle'] % cupy.pi) / angle_size).astype(cupy.int32)
         dataframe['offset_bin'] = cupy.floor(dataframe['offset'] / offset_size).astype(cupy.int32)
         return dataframe.groupby(['angle_bin', 'offset_bin'])
+    
+    @staticmethod
+    def __create_obb(start_x, start_y, end_x, end_y, width):
+        # Compute line directions and lengths
+        dx = end_x - start_x
+        dy = end_y - start_y
+        length = cupy.sqrt(dx**2 + dy**2)
+
+        # Unit direction vectors
+        ux = dx / length
+        uy = dy / length
+
+        # Perpendicular vectors (unit)
+        perp_x = -uy
+        perp_y = ux
+
+        # Half dimensions
+        half_length = (length / 2) + width
+        half_width = width / 2
+
+        # Midpoints of the lines
+        mid_x = (start_x + end_x) / 2
+        mid_y = (start_y + end_y) / 2
+
+        # Corners (4 per OBB)
+        corner1_x = mid_x - ux * half_length - perp_x * half_width
+        corner1_y = mid_y - uy * half_length - perp_y * half_width
+
+        corner2_x = mid_x + ux * half_length - perp_x * half_width
+        corner2_y = mid_y + uy * half_length - perp_y * half_width
+
+        corner3_x = mid_x + ux * half_length + perp_x * half_width
+        corner3_y = mid_y + uy * half_length + perp_y * half_width
+
+        corner4_x = mid_x - ux * half_length + perp_x * half_width
+        corner4_y = mid_y - uy * half_length + perp_y * half_width
+
+        # Stack corners: shape (n_lines, 4, 2)
+        obb = cupy.stack([
+            cupy.stack([corner1_x, corner1_y], axis=1),
+            cupy.stack([corner2_x, corner2_y], axis=1),
+            cupy.stack([corner3_x, corner3_y], axis=1),
+            cupy.stack([corner4_x, corner4_y], axis=1)
+        ], axis=1)
+
+        return obb
+    
+    @staticmethod
+    def __hilbert_sort(mid_x, mid_y, resolution=1024, bits=10):
+        # Normalize to [0, resolution)
+        x = ((mid_x - mid_x.min()) / mid_x.max() - mid_x.min() * (resolution - 1)).astype(cupy.uint32)
+        y = ((mid_y - mid_y.min()) / mid_y.max() - mid_y.min() * (resolution - 1)).astype(cupy.uint32)
         
+        
+        # Normalize to [0, resolution)
+        x = ((mid_x - mid_x.min()) / (mid_x.max() - mid_x.min()) * (resolution - 1)).astype(cupy.uint32)
+        y = ((mid_y - mid_y.min()) / (mid_y.max() - mid_y.min()) * (resolution - 1)).astype(cupy.uint32)
+
+        # Compute Hilbert indices using bitwise math
+        n = x.shape[0]
+        indices = cupy.zeros(n, dtype=cupy.uint32)
+
+        for i in range(bits - 1, -1, -1):
+            xi = (x >> i) & 1
+            yi = (y >> i) & 1
+            indices |= ((3 * xi) ^ yi) << (2 * i)
+        
+        # Argsort to reorder lines
+        indices = cupy.argsort(indices)
+        
+        return indices
+    
+    @staticmethod
+    def __create_bins_spatial(hilbert_indices, num_bins):
+        total = hilbert_indices.shape[0]
+        bin_size = total // num_bins
+        bins: List[cupy.ndarray] = []
+        for i in range(num_bins):
+            start = i * bin_size
+            end = total if i == num_bins - 1 else (i + 1) * bin_size
+            bins.append(hilbert_indices[start:end])
+        return bins
+    
     def ParallelDetection(self, max_threshold=50, colinear_threshold=0.5, min_overlap_ratio=0.2,
                           angle_tolerance=cupy.radians(0.01), bin_angle_size=cupy.radians(0.25)):
         dataframe = self.__dataframe.copy()
         dataframe['angle'] = dataframe['angle'] % cupy.pi  # collapse symmetrical directions
         
-        bins = self.__create_bins(dataframe, bin_angle_size, max_threshold)
+        bins = self.__create_bins_angle_offset(dataframe, bin_angle_size, max_threshold)
         
         # Include neighboring bins for robustness
         for (angle, offset), _ in bins:
             neighboring_bins = [(angle + da, offset + do) for da in (-1, 0, 1) for do in (-1, 0, 1)]
-            neighboringBinsIndexes = [bins.groups[bin] for bin in neighboring_bins if bin in bins.groups]
+            neighboringBinsIndices = [bins.groups[bin] for bin in neighboring_bins if bin in bins.groups]
             
-            lineIndexes = cupy.concatenate([i.to_cupy() for i in neighboringBinsIndexes])
+            lineIndices = cupy.concatenate([i.to_cupy() for i in neighboringBinsIndices])
             
-            if len(lineIndexes) < 2: continue
+            if len(lineIndices) < 2: continue
             
-            subset = dataframe.take(lineIndexes).reset_index(drop=True)
+            subset = dataframe.take(lineIndices).reset_index(drop=True)
             
             coordinates = cupy.stack([subset['angle'].to_cupy(), subset['offset'].to_cupy()], axis=1)
             space2D = cKDTree(coordinates)
@@ -200,7 +282,7 @@ class Graph:
                         edgeAttributes[self.colinear] = 1 if distance < colinear_threshold else 0
                         edgeAttributes[self.perpendicular_distance] = distance / dataframe["length"].max()
                         edgeAttributes[self.overlap_ratio] = overlapRatio
-                        self.edges.append(int((lineIndexes[a]), int(lineIndexes[b])))
+                        self.edges.append(int((lineIndices[a]), int(lineIndices[b])))
                         self.edgeAttributes.append(edgeAttributes)
                                    
     def IntersectionDetection(self, threshold=0.5, co_linear_tolerance=cupy.radians(0.01)):
