@@ -9,7 +9,7 @@ from shapely.geometry import LineString, Point
 from shapely.ops import nearest_points
 
 class Graph:
-    __edge_attributes = cupy.arange(10, dtype=cupy.int32)
+    _edge_attributes = cupy.arange(10, dtype=cupy.int32)
     
     parallel = 0
     colinear = 1
@@ -22,8 +22,8 @@ class Graph:
     angle_difference_cos = 8
     perimeter_intersection = 9
     
-    def __init__(self, dataframe):
-        self.__dataframe = dataframe
+    def __init__(self, dataframe, edges=10**6):
+        self._dataframe = dataframe
         
         start_x, start_y = dataframe['start_x'], dataframe['start_y']
         end_x, end_y = dataframe['end_x'], dataframe['end_y']
@@ -66,11 +66,11 @@ class Graph:
             arc_flags
         ]).toDlpack())
         
-        self.edges: List[Tuple[int, int]] = []
-        self.edgeAttributes: List[List[float]] = []
+        self.edges = self.edges[:, :edges]
+        self.edgeAttributes = self.edgeAttributes[:edges, :]
            
     @staticmethod
-    def __overlap_ratios(lineA, lineB):
+    def overlap_ratios(lineA, lineB):
         xA1, yA1, xA2, yA2, lengthA = lineA[['start_x', 'start_y', 'end_x', 'end_y', 'length']]
         xB1, yB1, xB2, yB2, lengthB = lineB[['start_x', 'start_y', 'end_x', 'end_y', 'length']]
         
@@ -121,13 +121,13 @@ class Graph:
         return overlapAinB, overlapBinA
     
     @staticmethod
-    def __is_point_intersection(self, threshold, ix, iy, x1, y1, x2, y2):
+    def is_point_intersection(self, threshold, ix, iy, x1, y1, x2, y2):
         d1 = cupy.hypot(ix - x1, iy - y1)
         d2 = cupy.hypot(ix - x2, iy - y2)
         return (d1 <= threshold) | (d2 <= threshold)
     
     @staticmethod
-    def __create_arc(center, radius, startAngle, endAngle, segments=16):
+    def create_arc(center, radius, startAngle, endAngle, segments=16):
         points = []
         startAngle = math.radians(startAngle)
         endAngle   = math.radians(endAngle)
@@ -145,14 +145,14 @@ class Graph:
         return points
 
     @staticmethod
-    def __create_bins_angle_offset(dataframe, angle_size, offset_size):
+    def create_bins_angle_offset(dataframe, angle_size, offset_size):
         # Bin keys for each line
         dataframe['angle_bin'] = cupy.floor((dataframe['angle'] % cupy.pi) / angle_size).astype(cupy.int32)
         dataframe['offset_bin'] = cupy.floor(dataframe['offset'] / offset_size).astype(cupy.int32)
         return dataframe.groupby(['angle_bin', 'offset_bin'])
     
     @staticmethod
-    def __create_obb(start_x, start_y, end_x, end_y, width):
+    def create_obb(start_x, start_y, end_x, end_y, width):
         # Compute line directions and lengths
         dx = end_x - start_x
         dy = end_y - start_y
@@ -198,12 +198,7 @@ class Graph:
         return obb
     
     @staticmethod
-    def __hilbert_sort(mid_x, mid_y, resolution=1024, bits=10):
-        # Normalize to [0, resolution)
-        x = ((mid_x - mid_x.min()) / mid_x.max() - mid_x.min() * (resolution - 1)).astype(cupy.uint32)
-        y = ((mid_y - mid_y.min()) / mid_y.max() - mid_y.min() * (resolution - 1)).astype(cupy.uint32)
-        
-        
+    def hilbert_sort(mid_x, mid_y, resolution=1024, bits=10):
         # Normalize to [0, resolution)
         x = ((mid_x - mid_x.min()) / (mid_x.max() - mid_x.min()) * (resolution - 1)).astype(cupy.uint32)
         y = ((mid_y - mid_y.min()) / (mid_y.max() - mid_y.min()) * (resolution - 1)).astype(cupy.uint32)
@@ -223,22 +218,146 @@ class Graph:
         return indices
     
     @staticmethod
-    def __create_bins_spatial(hilbert_indices, num_bins):
+    def create_bins_spatial(hilbert_indices, num_bins):
         total = hilbert_indices.shape[0]
         bin_size = total // num_bins
-        bins: List[cupy.ndarray] = []
-        for i in range(num_bins):
-            start = i * bin_size
-            end = total if i == num_bins - 1 else (i + 1) * bin_size
-            bins.append(hilbert_indices[start:end])
-        return bins
+        
+        # Compute the bin indices for each element
+        bin_indices = cupy.arange(total) // bin_size
+        bin_indices = cupy.minimum(bin_indices, num_bins - 1)
+        
+        # Sort indices by bin id
+        sort_order = cupy.lexsort((hilbert_indices, bin_indices))
+        sorted_indices = hilbert_indices[sort_order]
+        sorted_bins = bin_indices[sort_order]
+        
+        # Count how many elements per bin
+        bin_counts = cupy.bincount(sorted_bins, minlength=num_bins)
+        max_bin_size = bin_counts.max()
+        
+        # Prepare output matrix with -1 padding
+        bins_matrix = cupy.full((num_bins, max_bin_size), -1, dtype=hilbert_indices.dtype)
+        
+        # Compute flattened row and column indices for scatter assignment
+        bin_repeat = cupy.repeat(cupy.arange(num_bins), bin_counts)
+        bin_positions = cupy.concatenate([cupy.arange(count) for count in bin_counts.tolist()])
+        bins_matrix[bin_repeat, bin_positions] = sorted_indices
+        
+        return bins_matrix, bin_counts
+    
+    @staticmethod
+    def _get_axes(corners):
+        # Returns the two edge directions as axes to test (unit vectors)
+        edge1 = corners[:, 1] - corners[:, 0]
+        edge2 = corners[:, 3] - corners[:, 0] 
+        axes = cupy.stack([edge1, edge2], axis=1) 
+        lengths = cupy.linalg.norm(axes, axis=2, keepdims=True)
+        return axes / lengths
+    
+    @staticmethod
+    def _project(corners, axes):
+        return cupy.einsum('nij,nkj->nki', corners, axes)
+    
+    @staticmethod
+    def check_overlap_sat(obbs_a, obbs_b):
+        # Get the 4 corners of each box
+        axes_a = Graph._get_axes(obbs_a)
+        axes_b = Graph._get_axes(obbs_b)
+        axes = cupy.concatenate([axes_a, axes_b], axis=1)
+        
+        projections_a = Graph._project(obbs_a, axes)
+        projections_b = Graph._project(obbs_b, axes)
+        
+        proj_a_min = projections_a.min(axis=2)
+        proj_a_max = projections_a.max(axis=2)
+        proj_b_min = projections_b.min(axis=2)
+        proj_b_max = projections_b.max(axis=2)
+        
+        separating_axes = (proj_a_max < proj_b_min) | (proj_b_max < proj_a_min)
+        overlap = ~cupy.any(separating_axes, axis=1)
+        
+        return overlap  # Boolean mask for overlapping pairs
+        
+    @staticmethod
+    def _cross(vector_a, vector_b):
+        return vector_a[:, 0] * vector_b[:, 1] - vector_a[:, 1] * vector_b[:, 0]
+    
+    @staticmethod
+    def segment_intersection(p1, p2, q1, q2):
+        # Define vectors
+        va = p2 - p1
+        vb = q2 - q1
+        qp = q1 - p1
+        
+        denominator = Graph._cross(va, vb)
+        
+        # Avoid division by zero: mask where denom != 0
+        valid = denominator != 0
+        ta = cupy.zeros_like(denominator)
+        tb = cupy.zeros_like(denominator)
+        intersections = cupy.full_like(p1, cupy.nan)
+        
+        ta[valid] = Graph._cross(qp[valid], vb[valid]) / denominator[valid]
+        tb[valid] = Graph._cross(qp[valid], va[valid]) / denominator[valid]
+        
+        # Condition for segments intersecting
+        condition = (ta >= 0) & (ta <= 1) & (tb >= 0) & (tb <= 1) & valid
+        
+        # Compute intersection points only where condition is True
+        intersections[condition] = p1[condition] + ta[condition].reshape(-1, 1) * va[condition]
+        return intersections, condition
+    
+    @staticmethod
+    def _point_to_segment_closest(p, a, b):
+        """Returns the closest point on segment ab to point p."""
+        ap = p - a
+        ab = b - a
+        ab_length_squared = cupy.sum(ab ** 2, axis=1)
+        
+        # fractional position of the projection along segment ab
+        t = cupy.sum(ap * ab, axis=1) / ab_length_squared
+        t = cupy.clip(t, 0, 1).reshape(-1, 1)
+        
+        closest = a + t * ab
+        
+        return closest
+    
+    @staticmethod
+    def endpoint_threshold_check(p1, p2, q1, q2, threshold=0.5):
+        batch_size = p1.shape[0]
+        
+        # Stack all endpoints and their corresponding opposite segments
+        points = cupy.stack([p1, p2, q1, q2], axis=1).reshape(-1, 2) 
+        segments_a = cupy.repeat(cupy.concatenate([q1, p1]), 2, axis=0)
+        segments_b = cupy.repeat(cupy.concatenate([q2, p2]), 2, axis=0)
+        
+        # Compute closest points on each segment
+        closest = Graph._point_to_segment_closest(points, segments_a, segments_b)
+        distance_squared = cupy.sum((points - closest) ** 2, axis=1)
+        hits = distance_squared <= threshold**2
+        
+        # Compute midpoints
+        midpoints = (points + closest) / 2
+        
+        # Reshape results to (4, N, 2)
+        midpoints = midpoints.reshape(4, batch_size, 2)
+        hits = hits.reshape(4, batch_size)
+        
+        # Select the first valid midpoint per line pair
+        first_hit = hits.argmax(axis=0)
+        valid = hits.any(axis=0)
+        
+        midpoint_result = midpoints[first_hit, cupy.arange(batch_size)]
+        midpoint_result[~valid] = cupy.nan
+        
+        return midpoint_result
     
     def ParallelDetection(self, max_threshold=50, colinear_threshold=0.5, min_overlap_ratio=0.2,
                           angle_tolerance=cupy.radians(0.01), bin_angle_size=cupy.radians(0.25)):
-        dataframe = self.__dataframe.copy()
+        dataframe = self._dataframe.copy()
         dataframe['angle'] = dataframe['angle'] % cupy.pi  # collapse symmetrical directions
         
-        bins = self.__create_bins_angle_offset(dataframe, bin_angle_size, max_threshold)
+        bins = self.create_bins_angle_offset(dataframe, bin_angle_size, max_threshold)
         
         # Include neighboring bins for robustness
         for (angle, offset), _ in bins:
@@ -266,7 +385,7 @@ class Graph:
                     if subset['circle'].iloc[j] or subset['arc'].iloc[j]: continue
                     
                     line_i, line_j = subset.iloc[i], subset.iloc[j]
-                    overlapA, overlapB = self.__overlap_ratios(line_i, line_j)
+                    overlapA, overlapB = self.overlap_ratios(line_i, line_j)
                     if min(overlapA, overlapB) <= min_overlap_ratio: continue
                     
                     angle_j = subset['angle'].iloc[j]
@@ -277,7 +396,7 @@ class Graph:
                     
                     # Assign normalized distances to edges
                     for (a, b, overlapRatio) in [(i, j, overlapA), (j, i, overlapB)]:
-                        edgeAttributes = cupy.zeros(len(self.__edge_attributes), dtype=cupy.float32)
+                        edgeAttributes = cupy.zeros(len(self._edge_attributes), dtype=cupy.float32)
                         edgeAttributes[self.parallel] = 1
                         edgeAttributes[self.colinear] = 1 if distance < colinear_threshold else 0
                         edgeAttributes[self.perpendicular_distance] = distance / dataframe["length"].max()
@@ -286,17 +405,68 @@ class Graph:
                         self.edgeAttributes.append(edgeAttributes)
                                    
     def IntersectionDetection(self, threshold=0.5, co_linear_tolerance=cupy.radians(0.01)):
-        dataframe = self.__dataframe.copy()
+        dataframe = self._dataframe.copy()
         
+        # bin settings
+        min_num_bins = 1
+        lines_per_bin = 150
+        depth_percentage = 1.0
+        min_neighbor_deph = 10
+        
+        # Step 1: Filter valid line indices
         isLine = (dataframe['circle'] == 0) & (dataframe['arc'] == 0)
         lines = dataframe[isLine].reset_index(drop=True)
         circular_elements = dataframe[~isLine].reset_index(drop=True)
         
+        # Extract coordinates
         angle = lines['angle'].to_cupy()
         start_x = lines['start_x'].to_cupy()
         start_y = lines['start_y'].to_cupy()
         end_x = lines['end_x'].to_cupy()
         end_y = lines['end_y'].to_cupy()
+        
+        # Compute line midpoints and OBBs
+        mid_x = (start_x + end_x) / 2
+        mid_y = (start_y + end_y) / 2
+        obbs = self.create_obb(start_x, start_y, end_x, end_y, width=threshold)
+        
+        obb_centroids = obbs.mean(axis=1)
+        mid_x = obb_centroids[:, 0]
+        mid_y = obb_centroids[:, 1]
+        
+        # Hilbert sort and dynamic binning
+        hilbert_order = self.hilbert_sort(mid_x, mid_y)
+        num_bins = max(min_num_bins, int(len(lines) / lines_per_bin))
+        bins_matrix, bin_counts = self.create_bins_spatial(hilbert_order, num_bins=num_bins)
+        
+        # Define neighbor depth based on percentage of total bins
+        neighbor_depth = max(min_neighbor_deph, int(num_bins * depth_percentage))
+        
+        # Step 2: Check pairwise overlaps within bins and neighbor bins (forward only)
+        for bin_i in range(num_bins):
+            for offset in range(neighbor_depth + 1):
+                bin_j = bin_i + offset
+                if bin_j >= num_bins: continue
+                
+                indices_i = bins_matrix[bin_i]
+                indices_j = bins_matrix[bin_j]
+
+                indices_i = indices_i[indices_i != -1]
+                indices_j = indices_j[indices_j != -1]
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
         
         # Create cuSpatial-compatible linestrings
         offsetIndexes = cupy.arange(0, len(lines) * 2 + 1, 2, dtype=cupy.int32)
@@ -338,7 +508,7 @@ class Graph:
             intersection_x, intersection_y = intersections_x[k], intersections_y[k]
             
             for a, b in [(i, j), (j, i)]:
-               isPointIntersection = self.__is_point_intersection(threshold, 
+               isPointIntersection = self.is_point_intersection(threshold, 
                                                 intersection_x, intersection_y,
                                                 start_x[a], start_y[a], end_x[a], end_y[a],)
                 
@@ -358,7 +528,7 @@ class Graph:
         # Step 1: Separate lines vs circles
         geometryCircular: List[Tuple[int, LineString]] = []
         geometryLines: List[Tuple[int, LineString]] = []
-        for i, row in self.__dataframe.iterrows():
+        for i, row in self._dataframe.iterrows():
             if row["circle"]:
                 center = Point(row["start_x"], row["start_y"])
                 radius = row["radius"]
@@ -369,7 +539,7 @@ class Graph:
                 radius = row["radius"]
                 startAngle = row["start_angle"]
                 endAngle = row["end_angle"]
-                arcPoints = self.__create_arc(center, radius, startAngle, endAngle, segments=16)
+                arcPoints = self.create_arc(center, radius, startAngle, endAngle, segments=16)
                 arc = LineString(arcPoints)
                 geometryCircular.append((i, arc))      
             else:
@@ -389,8 +559,8 @@ class Graph:
                 if i >= j: continue  # Avoid duplicate processing
                 
                 # Angle check (skip nearly identical lines)
-                angle_i = self.__dataframe.iloc[i]["angle"]
-                angle_j = self.__dataframe.iloc[j]["angle"]
+                angle_i = self._dataframe.iloc[i]["angle"]
+                angle_j = self._dataframe.iloc[j]["angle"]
                 minAngleDifference = (angle_j - angle_i) % math.pi
                 minAngleDifference = min(minAngleDifference, math.pi - minAngleDifference)
                 if minAngleDifference < co_linear_tolerance: continue
@@ -413,10 +583,10 @@ class Graph:
                 
                 # Step 5: Add edges with normalized angleDifference
                 for a, b in [(i, j), (j, i)]:
-                    row = self.__dataframe.iloc[a]
+                    row = self._dataframe.iloc[a]
                     rowPoints = [(row["start_x"], row["start_y"]), (row["end_x"], row["end_y"])]
-                    isPointIntersection = self.__is_point_intersection(intersection, rowPoints, threshold)
-                    edgeAttributes = self.__edge_attributes.copy()
+                    isPointIntersection = self.is_point_intersection(intersection, rowPoints, threshold)
+                    edgeAttributes = self._edge_attributes.copy()
                     edgeAttributes["point_intersection"] = 1 if isPointIntersection else 0
                     edgeAttributes["segment_intersection"] = 0 if isPointIntersection else 1
                     edgeAttributes["angle_difference"] = minAngleDifference / (math.pi / 2)
@@ -446,16 +616,16 @@ class Graph:
                 elif intersection.geom_type == "MultiPoint":intersection = list(intersection.geoms)[0].coords[0]
                 else: intersection = intersection.interpolate(0.5, normalized=True).coords[0]
                 
-                row = self.__dataframe.iloc[j]
+                row = self._dataframe.iloc[j]
                 rowPoints = [(row["start_x"], row["start_y"]), (row["end_x"], row["end_y"])] 
-                isPointIntersection = self.__is_point_intersection(intersection, rowPoints, threshold)
+                isPointIntersection = self.is_point_intersection(intersection, rowPoints, threshold)
                 
-                edgeAttributes = self.__edge_attributes.copy()
+                edgeAttributes = self._edge_attributes.copy()
                 edgeAttributes["perimeter_intersection"] = 1
                 self.edges.append((i, j))
                 self.edgeAttributes.append(list(edgeAttributes.values()))
                 
-                edgeAttributes = self.__edge_attributes.copy()
+                edgeAttributes = self._edge_attributes.copy()
                 edgeAttributes["point_intersection"] = 1 if isPointIntersection else 0
                 edgeAttributes["segment_intersection"] = 0 if isPointIntersection else 1
                 self.edges.append((j, i))
@@ -729,3 +899,16 @@ def BalanceClassWeights(dataset, device="cpu", smoothing_factor=0.2, classificat
     
     return torch.tensor(class_weights, dtype=torch.float).to(device)
 
+"""
+1 - build an OBB with threshold width for every line
+2 - Hilbert-sort the OBB centers and then group then into bins
+2 - apply BVH per bin, run a tiny SAT kernel for quick finding
+3 - for each pair of lines in which its OBBs overlap we use Segment-to-Segment to compute its intersection
+4 - in case it doesn't find the intersection, check the threshold radius on the endpoints via vector math
+
+
+hilbert_sort - uses the full OBB centroid (obbs.mean(axis=1)) for sorting
+
+create_bins_spatial - query neighbor bins combining only future bins
+
+"""
