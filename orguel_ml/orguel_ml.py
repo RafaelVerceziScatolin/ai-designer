@@ -414,9 +414,9 @@ class Graph:
         min_neighbor_deph = 10
         
         # Step 1: Filter valid line indices
-        isLine = (dataframe['circle'] == 0) & (dataframe['arc'] == 0)
-        lines = dataframe[isLine].reset_index(drop=True)
-        circular_elements = dataframe[~isLine].reset_index(drop=True)
+        is_line = (dataframe['circle'] == 0) & (dataframe['arc'] == 0)
+        lines = dataframe[is_line].reset_index(drop=True)
+        circular_elements = dataframe[~is_line].reset_index(drop=True)
         
         # Extract coordinates
         angle = lines['angle'].to_cupy()
@@ -426,10 +426,7 @@ class Graph:
         end_y = lines['end_y'].to_cupy()
         
         # Compute line midpoints and OBBs
-        mid_x = (start_x + end_x) / 2
-        mid_y = (start_y + end_y) / 2
         obbs = self.create_obb(start_x, start_y, end_x, end_y, width=threshold)
-        
         obb_centroids = obbs.mean(axis=1)
         mid_x = obb_centroids[:, 0]
         mid_y = obb_centroids[:, 1]
@@ -453,6 +450,88 @@ class Graph:
 
                 indices_i = indices_i[indices_i != -1]
                 indices_j = indices_j[indices_j != -1]
+                
+                if indices_i.shape[0] == 0 or indices_j.shape[0] == 0: continue
+                
+                indices_i, indices_j = cupy.meshgrid(indices_i, indices_j, indexing='ij')
+                indices_i = indices_i.flatten()
+                indices_j = indices_j.flatten()
+                
+                # Skip self-pairs and enforce order to avoid duplicates
+                valid = indices_i < indices_j
+                indices_i = indices_i[valid]
+                indices_j = indices_j[valid]
+                
+                if indices_i.shape[0] == 0: continue
+                
+                # Extract OBBs and coordinates
+                obbs_i = obbs[indices_i]
+                obbs_j = obbs[indices_j]
+                
+                # SAT check
+                overlap = self.check_overlap_sat(obbs_i, obbs_j)
+                indices_i = indices_i[overlap]
+                indices_j = indices_j[overlap]
+                
+                if indices_i.shape[0] == 0: continue
+                
+                # Segment intersection
+                p1 = cupy.stack([start_x[indices_i], start_y[indices_i]], axis=1)
+                p2 = cupy.stack([end_x[indices_i], end_y[indices_i]], axis=1)
+                q1 = cupy.stack([start_x[indices_j], start_y[indices_j]], axis=1)
+                q2 = cupy.stack([end_x[indices_j], end_y[indices_j]], axis=1)
+                
+                intersections, condition = self.segment_intersection(p1, p2, q1, q2)
+                
+                midpoints_ij = self.endpoint_threshold_check(p1, p2, q1, q2, threshold)
+                midpoints_ji = self.endpoint_threshold_check(q1, q2, p1, p2, threshold)
+                midpoints_ij = ~cupy.isnan(midpoints_ij).any(axis=1)
+                midpoints_ji = ~cupy.isnan(midpoints_ji).any(axis=1)
+                
+                # Angle difference
+                angle_i = angle[indices_i]
+                angle_j = angle[indices_j]
+                angle_difference = (angle_j - angle_i) % (2 * cupy.pi)
+                angle_difference_min = cupy.minimum(angle_difference, 2 * cupy.pi - angle_difference)
+                
+                # Filter colinear lines based on angle tolerance
+                colinear = (angle_difference_min % cupy.pi) >= co_linear_tolerance
+                condition = condition[colinear]
+                indices_i = indices_i[colinear]
+                indices_j = indices_j[colinear]
+                midpoints_ij = midpoints_ij[colinear]
+                midpoints_ji = midpoints_ji[colinear]
+                angle_difference = angle_difference[colinear]
+                angle_difference_min = angle_difference_min[colinear]
+                
+                is_point_intersection_ij = midpoints_ij | (condition & ~midpoints_ij)
+                is_point_intersection_ji = midpoints_ji | (condition & ~midpoints_ji)
+                is_segment_intersection_ij = ~is_point_intersection_ij
+                is_segment_intersection_ji = ~is_point_intersection_ji
+                
+                edge_attributes_ij = cupy.zeros(len(self._edge_attributes), dtype=cupy.float32)
+                edge_attributes_ij[:, self.point_intersection] = is_point_intersection_ij.astype(cupy.float32)
+                edge_attributes_ij[:, self.segment_intersection] = is_segment_intersection_ij.astype(cupy.float32)
+                edge_attributes_ij[:, self.angle_difference] = angle_difference_min / (cupy.pi / 2)
+                edge_attributes_ij[:, self.angle_difference_sin] = cupy.sin(angle_difference)
+                edge_attributes_ij[:, self.angle_difference_cos] = cupy.cos(angle_difference)
+
+                edge_attributes_ji = cupy.zeros(len(self._edge_attributes), dtype=cupy.float32)
+                edge_attributes_ji[:, self.point_intersection] = is_point_intersection_ji.astype(cupy.float32)
+                edge_attributes_ji[:, self.segment_intersection] = is_segment_intersection_ji.astype(cupy.float32)
+                edge_attributes_ji[:, self.angle_difference] = angle_difference_min / (cupy.pi / 2)
+                edge_attributes_ji[:, self.angle_difference_sin] = cupy.sin(angle_difference)
+                edge_attributes_ji[:, self.angle_difference_cos] = cupy.cos(angle_difference)
+                
+                
+                
+                
+                
+                
+                
+                
+
+                
         
         
         
@@ -468,49 +547,7 @@ class Graph:
         
         
         
-        # Create cuSpatial-compatible linestrings
-        offsetIndexes = cupy.arange(0, len(lines) * 2 + 1, 2, dtype=cupy.int32)
-        coordinates_x = cupy.empty(len(lines) * 2, dtype=cupy.float32)
-        coordinates_y = cupy.empty(len(lines) * 2, dtype=cupy.float32)
         
-        coordinates_x[::2] = start_x
-        coordinates_y[::2] = start_y
-        coordinates_x[1::2] = end_x
-        coordinates_y[1::2] = end_y
-        
-        # Build linestring geometry
-        geometryLines = cuspatial.GeometryColumn.from_lines(
-            cuspatial.make_linestring(offsetIndexes, coordinates_x, coordinates_y))
-        
-        # Compute pairwise intersections (projection of the lines)
-        result = cuspatial.linestring_intersection(geometryLines, geometryLines)
-        indexes_line_i = result["lhs_index"].to_cupy()
-        indexes_line_j = result["rhs_index"].to_cupy()
-        intersections_x,  intersections_y = result["x"].copy(), result["y"].copy()
-        
-        for k in range(len(result)):
-            i, j = indexes_line_i[k], indexes_line_j[k]
-            if i >= j: continue # Avoid duplicate processing
-            
-            # Check actual intersection
-            
-            
-            
-            
-            
-            # Angle check (skip nearly identical lines)
-            angle_i, angle_j = angle[i], angle[j]
-            minAngleDifference = (angle_j - angle_i) % cupy.pi
-            minAngleDifference = cupy.minimum(minAngleDifference, cupy.pi - minAngleDifference)
-            if minAngleDifference < co_linear_tolerance: continue
-            
-            # Check actual intersection
-            intersection_x, intersection_y = intersections_x[k], intersections_y[k]
-            
-            for a, b in [(i, j), (j, i)]:
-               isPointIntersection = self.is_point_intersection(threshold, 
-                                                intersection_x, intersection_y,
-                                                start_x[a], start_y[a], end_x[a], end_y[a],)
                 
                 
                 

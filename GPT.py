@@ -1,115 +1,150 @@
-import cupy
-import cudf
-import cuspatial
-from cupyx.scipy.spatial import cKDTree
+# GPU version of IntersectionDetection using OBBs and CuPy
+create_obb hilbert_sort create_bins_spatial check_overlap_sat segment_intersection endpoint_threshold_check
 
-class Graph:
-    def __is_point_intersection(self, px, py, x1, y1, x2, y2, threshold):
-        d1 = cupy.hypot(px - x1, py - y1)
-        d2 = cupy.hypot(px - x2, py - y2)
-        return (d1 <= threshold) | (d2 <= threshold)
 
-    def IntersectionDetection(self, threshold=0.5, co_linear_tolerance=cupy.radians(0.01)):
-        df = self.__dataframe.copy()
-        is_line = (df['circle'] == 0) & (df['arc'] == 0)
-        df_lines = df[is_line].reset_index(drop=True)
+def GPU_IntersectionDetection(self, threshold=0.5, co_linear_tolerance=cupy.radians(0.01)):
+    dataframe = self._dataframe.copy()
 
-        if len(df_lines) < 2:
-            return
+    # Step 1: Filter lines and circular elements
+    isLine = (dataframe['circle'] == 0) & (dataframe['arc'] == 0)
+    lines = dataframe[isLine].reset_index(drop=True)
+    circular_elements = dataframe[~isLine].reset_index(drop=True)
 
-        # Create cuSpatial-compatible linestrings
-        offsets = cupy.arange(0, len(df_lines) * 2 + 1, 2, dtype=cupy.int32)
-        points_x = cupy.empty(len(df_lines) * 2, dtype=cupy.float32)
-        points_y = cupy.empty(len(df_lines) * 2, dtype=cupy.float32)
+    # Extract coordinates
+    angle = lines['angle'].to_cupy()
+    start_x = lines['start_x'].to_cupy()
+    start_y = lines['start_y'].to_cupy()
+    end_x = lines['end_x'].to_cupy()
+    end_y = lines['end_y'].to_cupy()
 
-        start_x = df_lines['start_x'].to_cupy()
-        start_y = df_lines['start_y'].to_cupy()
-        end_x = df_lines['end_x'].to_cupy()
-        end_y = df_lines['end_y'].to_cupy()
+    # Compute line midpoints and OBBs
+    obbs = self.create_obb(start_x, start_y, end_x, end_y, width=threshold)
+    obb_centroids = obbs.mean(axis=1)
+    mid_x = obb_centroids[:, 0]
+    mid_y = obb_centroids[:, 1]
 
-        points_x[::2] = start_x
-        points_y[::2] = start_y
-        points_x[1::2] = end_x
-        points_y[1::2] = end_y
+    # Hilbert sort and dynamic binning
+    hilbert_order = self.hilbert_sort(mid_x, mid_y)
+    avg_lines_per_bin = 150
+    num_bins = max(1, int(len(lines) / avg_lines_per_bin))
+    bins_matrix, bin_counts = self.create_bins_spatial(hilbert_order, num_bins=num_bins)
 
-        geometry = cuspatial.GeometryColumn.from_lines(
-            cuspatial.make_linestring(offsets, points_x, points_y)
-        )
+    # Define neighbor depth based on percentage of total bins, with minimum of 10
+    depth_percentage = 0.1
+    neighbor_depth = max(10, int(num_bins * depth_percentage))
 
-        result = cuspatial.linestring_intersection(geometry, geometry)
-        i_indices = result["lhs_index"].to_cupy()
-        j_indices = result["rhs_index"].to_cupy()
-        intersections_x = result["x"].to_cupy()
-        intersections_y = result["y"].to_cupy()
-
-        angles = df_lines['angle'].to_cupy()
-
-        for idx in range(len(i_indices)):
-            i, j = int(i_indices[idx]), int(j_indices[idx])
-            if i >= j:
+    # Step 2: Check pairwise overlaps within bins and neighbor bins (forward only)
+    for bin_i in range(num_bins):
+        for offset in range(neighbor_depth + 1):
+            bin_j = bin_i + offset
+            if bin_j >= num_bins:
                 continue
 
-            angle_i = angles[i]
-            angle_j = angles[j]
-            minAngleDifference = (angle_j - angle_i) % cupy.pi
-            minAngleDifference = min(minAngleDifference, cupy.pi - minAngleDifference)
-            if minAngleDifference < co_linear_tolerance:
+            indices_i = bins_matrix[bin_i]
+            indices_j = bins_matrix[bin_j]
+
+            indices_i = indices_i[indices_i != -1]
+            indices_j = indices_j[indices_j != -1]
+
+            if indices_i.shape[0] == 0 or indices_j.shape[0] == 0:
                 continue
 
-            px, py = intersections_x[idx], intersections_y[idx]
+            A_idx, B_idx = cupy.meshgrid(indices_i, indices_j, indexing='ij')
+            A_idx = A_idx.flatten()
+            B_idx = B_idx.flatten()
 
-            angleDifference = (angle_j - angle_i) % (2 * cupy.pi)
+            valid_mask = A_idx < B_idx
+            A_idx = A_idx[valid_mask]
+            B_idx = B_idx[valid_mask]
 
-            for a, b in [(i, j), (j, i)]:
-                x1, y1 = start_x[a], start_y[a]
-                x2, y2 = end_x[a], end_y[a]
-                isPoint = self.__is_point_intersection(px, py, x1, y1, x2, y2, threshold)
+            if A_idx.shape[0] == 0:
+                continue
 
-                attr = cupy.zeros(len(self.__edge_attributes), dtype=cupy.float32)
-                attr[self.point_intersection] = 1 if isPoint else 0
-                attr[self.segment_intersection] = 0 if isPoint else 1
-                attr[self.angle_difference] = minAngleDifference / (cupy.pi / 2)
-                attr[self.angle_difference_sin] = cupy.sin(angleDifference)
-                attr[self.angle_difference_cos] = cupy.cos(angleDifference)
+            obb_a = obbs[A_idx]
+            obb_b = obbs[B_idx]
 
-                self.edges.append((int(df_lines.index[a]), int(df_lines.index[b])))
-                self.edgeAttributes.append(list(attr.tolist()))
+            overlap_mask = self.check_overlap_sat(obb_a, obb_b)
+            A_idx = A_idx[overlap_mask]
+            B_idx = B_idx[overlap_mask]
 
-        # Endpoint-to-segment proximity intersection check
-        endpoints_x = cupy.concatenate([start_x, end_x])
-        endpoints_y = cupy.concatenate([start_y, end_y])
-        endpoints_idx = cupy.arange(len(endpoints_x))
+            if A_idx.shape[0] == 0:
+                continue
 
-        segment_centers_x = (start_x + end_x) / 2
-        segment_centers_y = (start_y + end_y) / 2
+            p1 = cupy.stack([start_x[A_idx], start_y[A_idx]], axis=1)
+            p2 = cupy.stack([end_x[A_idx], end_y[A_idx]], axis=1)
+            q1 = cupy.stack([start_x[B_idx], start_y[B_idx]], axis=1)
+            q2 = cupy.stack([end_x[B_idx], end_y[B_idx]], axis=1)
 
-        tree = cKDTree(cupy.stack([segment_centers_x, segment_centers_y], axis=1))
+            intersections, intersect_mask = self.segment_intersection(p1, p2, q1, q2)
 
-        for k in range(len(endpoints_x)):
-            ex, ey = endpoints_x[k], endpoints_y[k]
-            neighbors = tree.query_ball_point([ex, ey], r=threshold)
+            # Determine if fallback was used and if fallback returned valid midpoint
+            fallback_ij = self.endpoint_threshold_check(p1, p2, q1, q2, threshold) #########################
+            fallback_ji = self.endpoint_threshold_check(q1, q2, p1, p2, threshold) #########################
 
-            for seg in neighbors:
-                # Avoid self-linking
-                if k // 2 == seg:
-                    continue
+            fallback_valid_ij = ~cupy.isnan(fallback_ij).any(axis=1) #########################
+            fallback_valid_ji = ~cupy.isnan(fallback_ji).any(axis=1) #########################
+            
+            angle_i = angle[A_idx]
+            angle_j = angle[B_idx]
+            angle_diff = (angle_j - angle_i) % (2 * cupy.pi)
+            angle_diff_min = cupy.minimum(angle_diff, 2 * cupy.pi - angle_diff)
 
-                # Midpoint between endpoint and segment center
-                mx = (ex + segment_centers_x[seg]) / 2
-                my = (ey + segment_centers_y[seg]) / 2
+            angle_diff_mod = angle_diff_min % cupy.pi
+            colinear_mask = angle_diff_mod >= co_linear_tolerance
+            A_idx = A_idx[colinear_mask]
+            B_idx = B_idx[colinear_mask]
 
-                angle_i = angles[k // 2]
-                angle_j = angles[seg]
-                angleDifference = (angle_j - angle_i) % (2 * cupy.pi)
-                minAngleDifference = min(angleDifference, cupy.pi - angleDifference)
+            angle_diff = angle_diff[colinear_mask] 
+            angle_diff_min = angle_diff_min[colinear_mask]
+            intersect_mask = intersect_mask[colinear_mask] #########################
+            fallback_valid_ij = fallback_valid_ij[colinear_mask] #########################
+            fallback_valid_ji = fallback_valid_ji[colinear_mask] #########################
 
-                for a, b in [(k // 2, seg), (seg, k // 2)]:
-                    attr = cupy.zeros(len(self.__edge_attributes), dtype=cupy.float32)
-                    attr[self.point_intersection] = 1
-                    attr[self.segment_intersection] = 0
-                    attr[self.angle_difference] = minAngleDifference / (cupy.pi / 2)
-                    attr[self.angle_difference_sin] = cupy.sin(angleDifference)
-                    attr[self.angle_difference_cos] = cupy.cos(angleDifference)
+            normalized_angle_diff = angle_diff_min / (cupy.pi / 2)
 
-                    self.edges.append((int(df_lines.index[a]), int(df_lines.index[b])))
-                    self.edgeAttributes.append(list(attr.tolist()))
+            i_nodes = cupy.array(A_idx, dtype=cupy.int32)
+            j_nodes = cupy.array(B_idx, dtype=cupy.int32)
+
+            edges_ij = cupy.stack([i_nodes, j_nodes], axis=0)
+            edges_ji = cupy.stack([j_nodes, i_nodes], axis=0)
+            edges_all = cupy.concatenate([edges_ij, edges_ji], axis=1)
+
+            num_edges = i_nodes.shape[0]
+
+            point_ij = fallback_valid_ij | (intersect_mask & ~fallback_valid_ij) #########################
+            point_ji = fallback_valid_ji | (intersect_mask & ~fallback_valid_ji) #########################
+
+            segment_ij = ~point_ij #########################
+            segment_ji = ~point_ji #########################
+
+            attrs_ij = cupy.zeros((num_edges, 10), dtype=cupy.float32) #########################
+            attrs_ij[:, self.point_intersection] = point_ij.astype(cupy.float32) #########################
+            attrs_ij[:, self.segment_intersection] = segment_ij.astype(cupy.float32) #########################
+            attrs_ij[:, self.angle_difference] = normalized_angle_diff #########################
+            attrs_ij[:, self.angle_difference_sin] = cupy.sin(angle_diff) #########################
+            attrs_ij[:, self.angle_difference_cos] = cupy.cos(angle_diff) #########################
+
+            attrs_ji = cupy.zeros((num_edges, 10), dtype=cupy.float32) #########################
+            attrs_ji[:, self.point_intersection] = point_ji.astype(cupy.float32) #########################
+            attrs_ji[:, self.segment_intersection] = segment_ji.astype(cupy.float32) #########################
+            attrs_ji[:, self.angle_difference] = normalized_angle_diff #########################
+            attrs_ji[:, self.angle_difference_sin] = cupy.sin(angle_diff) #########################
+            attrs_ji[:, self.angle_difference_cos] = cupy.cos(angle_diff) #########################
+
+            attrs_all = cupy.concatenate([attrs_ij, attrs_ji], axis=0) #########################
+
+            if self._size + 2 * num_edges > self._capacity:
+                raise RuntimeError("Edge buffer overflow: increase preallocated edge size.")
+
+            start = self._size
+            end = start + edges_all.shape[1]
+            self.edges[:, start:end] = edges_all
+            self.edgeAttributes[start:end, :] = attrs_all
+            self._size = end
+
+
+
+
+
+
+
