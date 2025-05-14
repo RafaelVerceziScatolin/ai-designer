@@ -66,8 +66,9 @@ class Graph:
             arc_flags
         ]).toDlpack())
         
-        self.edges = self.edges[:, :edges]
-        self.edgeAttributes = self.edgeAttributes[:edges, :]
+        self._size = 0
+        self.edges = cupy.empty((2, edge_capacity), dtype=cupy.int32)
+        self.edgeAttributes = cupy.empty((edge_capacity, len(self._edge_attributes)), dtype=cupy.float32)
            
     @staticmethod
     def overlap_ratios(lineA, lineB):
@@ -504,25 +505,40 @@ class Graph:
                 angle_difference = angle_difference[colinear]
                 angle_difference_min = angle_difference_min[colinear]
                 
+                i_nodes = cupy.array(indices_i, dtype=cupy.int32)
+                j_nodes = cupy.array(indices_j, dtype=cupy.int32)
+                edges_ij = cupy.stack([i_nodes, j_nodes], axis=0)
+                edges_ji = cupy.stack([j_nodes, i_nodes], axis=0)
+                edges = cupy.concatenate([edges_ij, edges_ji], axis=1)
+                num_edges = i_nodes.shape[0]
+                
                 is_point_intersection_ij = midpoints_ij | (condition & ~midpoints_ij)
                 is_point_intersection_ji = midpoints_ji | (condition & ~midpoints_ji)
                 is_segment_intersection_ij = ~is_point_intersection_ij
                 is_segment_intersection_ji = ~is_point_intersection_ji
                 
-                edge_attributes_ij = cupy.zeros(len(self._edge_attributes), dtype=cupy.float32)
-                edge_attributes_ij[:, self.point_intersection] = is_point_intersection_ij.astype(cupy.float32)
-                edge_attributes_ij[:, self.segment_intersection] = is_segment_intersection_ij.astype(cupy.float32)
-                edge_attributes_ij[:, self.angle_difference] = angle_difference_min / (cupy.pi / 2)
-                edge_attributes_ij[:, self.angle_difference_sin] = cupy.sin(angle_difference)
-                edge_attributes_ij[:, self.angle_difference_cos] = cupy.cos(angle_difference)
+                attributes_ij = cupy.zeros((num_edges, len(self._edge_attributes)), dtype=cupy.float32)
+                attributes_ij[:, self.point_intersection] = is_point_intersection_ij.astype(cupy.float32)
+                attributes_ij[:, self.segment_intersection] = is_segment_intersection_ij.astype(cupy.float32)
+                attributes_ij[:, self.angle_difference] = angle_difference_min / (cupy.pi / 2)
+                attributes_ij[:, self.angle_difference_sin] = cupy.sin(angle_difference)
+                attributes_ij[:, self.angle_difference_cos] = cupy.cos(angle_difference)
 
-                edge_attributes_ji = cupy.zeros(len(self._edge_attributes), dtype=cupy.float32)
-                edge_attributes_ji[:, self.point_intersection] = is_point_intersection_ji.astype(cupy.float32)
-                edge_attributes_ji[:, self.segment_intersection] = is_segment_intersection_ji.astype(cupy.float32)
-                edge_attributes_ji[:, self.angle_difference] = angle_difference_min / (cupy.pi / 2)
-                edge_attributes_ji[:, self.angle_difference_sin] = cupy.sin(angle_difference)
-                edge_attributes_ji[:, self.angle_difference_cos] = cupy.cos(angle_difference)
+                attributes_ji = cupy.zeros((num_edges, len(self._edge_attributes)), dtype=cupy.float32)
+                attributes_ji[:, self.point_intersection] = is_point_intersection_ji.astype(cupy.float32)
+                attributes_ji[:, self.segment_intersection] = is_segment_intersection_ji.astype(cupy.float32)
+                attributes_ji[:, self.angle_difference] = angle_difference_min / (cupy.pi / 2)
+                attributes_ji[:, self.angle_difference_sin] = cupy.sin(angle_difference)
+                attributes_ji[:, self.angle_difference_cos] = cupy.cos(angle_difference)
                 
+                attributes = cupy.concatenate([attributes_ij, attributes_ji], axis=0)
+                
+                start = self._size
+                end = start + edges.shape[1]
+                self.edges[:, start:end] = edges
+                self.edgeAttributes[start:end, :] = attributes
+                
+                self._size = end
                 
                 
                 
