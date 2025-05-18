@@ -1,12 +1,5 @@
-from typing import List, Tuple
-import math
 import cupy
-import cuspatial
 from torch.utils.dlpack import from_dlpack
-from cupyx.scipy.spatial import cKDTree
-from shapely.strtree import STRtree
-from shapely.geometry import LineString, Point
-from shapely.ops import nearest_points
 
 class Graph:
     _edge_attributes = cupy.arange(10, dtype=cupy.int32)
@@ -22,7 +15,7 @@ class Graph:
     angle_difference_cos = 8
     perimeter_intersection = 9
     
-    def __init__(self, dataframe, edges=10**6):
+    def __init__(self, dataframe, edge_per_element=200):
         self._dataframe = dataframe
         
         start_x, start_y = dataframe['start_x'], dataframe['start_y']
@@ -65,6 +58,8 @@ class Graph:
             circle_flags,
             arc_flags
         ]).toDlpack())
+        
+        edge_capacity = len(dataframe) * edge_per_element
         
         self._size = 0
         self.edges = cupy.empty((2, edge_capacity), dtype=cupy.int32)
@@ -698,97 +693,91 @@ def LaplacianEigenvectors(graph, k=2):
     
     return graph
 
-from typing import Dict
 import ezdxf
 import torch
+import numpy
 import cudf
 from torch_geometric.data import Data
 
 def CreateGraph(dxf_file):
-    dataframe: List[Dict] = [ ]
     
     doc = ezdxf.readfile(dxf_file)
     modelSpace = doc.modelspace()
-    lineCollector = [line for line in modelSpace if line.dxftype() == 'LINE']
-    circleCollector = [circle for circle in modelSpace if circle.dxftype() == 'CIRCLE']
-    arcCollector = [arc for arc in modelSpace if arc.dxftype() == 'ARC']
     
-    # create a dataframe with line information
-    for line in lineCollector:
-        start_x, start_y, _ = line.dxf.start
-        end_x, end_y, _ = line.dxf.end
-        layer = line.dxf.layer
+    entities = [entity for entity in modelSpace if entity.dxftype() in ('LINE', 'CIRCLE', 'ARC')]
+    
+    if not entities: return
+    
+    count = len(entities)
+    
+    start_x = numpy.zeros(count, dtype=numpy.float32)
+    start_y = numpy.zeros(count, dtype=numpy.float32)
+    end_x = numpy.zeros(count, dtype=numpy.float32)
+    end_y = numpy.zeros(count, dtype=numpy.float32)
+    length = numpy.zeros(count, dtype=numpy.float32)
+    angle = numpy.zeros(count, dtype=numpy.float32)
+    layer = numpy.empty(count, dtype=object)
+    circle_flag = numpy.zeros(count, dtype=numpy.int8)
+    arc_flag = numpy.zeros(count, dtype=numpy.int8)
+    radius = numpy.zeros(count, dtype=numpy.float32)
+    start_angle = numpy.zeros(count, dtype=numpy.float32)
+    end_angle = numpy.zeros(count, dtype=numpy.float32)
+    
+    for i, entity in enumerate(entities):
+        entity_type = entity.dxftype()
+        layer[i] = entity.dxf.layer
         
-        length = math.hypot(end_x - start_x, end_y - start_y)
-        angle = math.atan2(end_y - start_y, end_x - start_x) % (2*math.pi)
+        if entity_type == 'LINE':
+            sx, sy, _ = entity.dxf.start
+            ex, ey, _ = entity.dxf.end
+            dx, dy = ex - sx, ey - sy
+            
+            start_x[i], start_y[i] = sx, sy
+            end_x[i], end_y[i] = ex, ey
+            length[i] = numpy.hypot(dx, dy)
+            angle[i] = numpy.arctan2(dy, dx) % (2*numpy.pi)
         
-        dataframe.append(
-            {
-                "start_x": start_x,
-                "start_y": start_y,
-                "end_x": end_x,
-                "end_y": end_y,
-                "length": length,
-                "angle": angle,
-                "layer": layer,
-                "circle": 0,
-                "arc": 0,
-                "radius": 0,
-                "start_angle": 0,
-                "end_angle": 0
-            }
-        )
-    
-    for circle in circleCollector:
-        center_x, center_y, _ = circle.dxf.center
-        radius = circle.dxf.radius
-        perimeter = 2 * math.pi * radius
-        layer = circle.dxf.layer
+        elif entity_type == 'CIRCLE':
+            cx, cy, _ = entity.dxf.center
+            r = entity.dxf.radius
+            l = 2 * numpy.pi * r
+            
+            circle_flag[i] = 1
+            start_x[i], start_y[i] = cx, cy
+            length[i] = l
+            radius[i] = r
         
-        dataframe.append(
-            {
-                "start_x": center_x,
-                "start_y": center_y,
-                "end_x": center_x,
-                "end_y": center_y,
-                "length": perimeter,
-                "angle": 0.0,
-                "layer": layer,
-                "circle": 1,
-                "arc": 0,
-                "radius": radius,
-                "start_angle": 0,
-                "end_angle": 0
-            }
-        )
+        elif entity_type == 'ARC':
+            cx, cy, _ = entity.dxf.center
+            r = entity.dxf.radius
+            sa = entity.dxf.start_angle
+            ea = entity.dxf.end_angle
+            l = r * numpy.radians((ea - sa) % 360)
+            
+            arc_flag[i] = 1
+            start_x[i], start_y[i] = cx, cy
+            length[i] = l
+            radius[i] = r
+            start_angle[i] = sa
+            end_angle[i] = ea
     
-    for arc in arcCollector:
-        center_x, center_y, _ = arc.dxf.center
-        radius = arc.dxf.radius
-        startAngle = arc.dxf.start_angle
-        endAngle = arc.dxf.end_angle
-        arcLength = radius * math.radians((endAngle - startAngle) % 360)
-        layer = arc.dxf.layer
+    dataframe = cudf.DataFrame(
+        {
+            "start_x": cupy.asarray(start_x),
+            "start_y": cupy.asarray(start_y),
+            "end_x": cupy.asarray(end_x),
+            "end_y": cupy.asarray(end_y),
+            "length": cupy.asarray(length),
+            "angle": cupy.asarray(angle),
+            "layer": layer,
+            "circle": cupy.asarray(circle_flag),
+            "arc": cupy.asarray(arc_flag),
+            "radius": cupy.asarray(radius),
+            "start_angle": cupy.asarray(start_angle),
+            "end_angle": cupy.asarray(end_angle)
+        }
+    )
         
-        dataframe.append(
-            {
-                "start_x": center_x,
-                "start_y": center_y,
-                "end_x": center_x,
-                "end_y": center_y,
-                "length": arcLength,
-                "angle": 0.0,
-                "layer": layer,
-                "circle": 0,
-                "arc": 1,
-                "radius": radius,
-                "start_angle": startAngle,
-                "end_angle": endAngle
-            }
-        )
-    
-    dataframe = cudf.DataFrame(dataframe)
-    
     # Define anchor point
     anchor_x = cupy.float32(cupy.concatenate([dataframe['start_x'].to_cupy(), dataframe['end_x'].to_cupy()]).min() - 100000)
     anchor_y = cupy.float32(cupy.concatenate([dataframe['start_y'].to_cupy(), dataframe['end_y'].to_cupy()]).min() - 100000)
@@ -813,6 +802,10 @@ def CreateGraph(dxf_file):
     graph = Graph(dataframe)
     graph.ParallelDetection()
     graph.IntersectionDetection()
+    
+    # Truncate after edge collection
+    graph.edges = graph.edges[:, :graph._size]
+    graph.edgeAttributes = graph.edgeAttributes[:graph._size, :]
     
     graph.classificationLabels = torch.tensor(graph.classificationLabels, dtype=torch.long)
     graph.nodeAttributes = torch.tensor(graph.nodeAttributes, dtype=torch.float)
@@ -937,16 +930,3 @@ def BalanceClassWeights(dataset, device="cpu", smoothing_factor=0.2, classificat
     
     return torch.tensor(class_weights, dtype=torch.float).to(device)
 
-"""
-1 - build an OBB with threshold width for every line
-2 - Hilbert-sort the OBB centers and then group then into bins
-2 - apply BVH per bin, run a tiny SAT kernel for quick finding
-3 - for each pair of lines in which its OBBs overlap we use Segment-to-Segment to compute its intersection
-4 - in case it doesn't find the intersection, check the threshold radius on the endpoints via vector math
-
-
-hilbert_sort - uses the full OBB centroid (obbs.mean(axis=1)) for sorting
-
-create_bins - query neighbor bins combining only future bins
-
-"""
