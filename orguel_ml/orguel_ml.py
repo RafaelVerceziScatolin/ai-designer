@@ -1,4 +1,6 @@
+from typing import List
 import cupy
+import cudf
 from torch.utils.dlpack import from_dlpack
 
 class Graph:
@@ -328,69 +330,65 @@ class Graph:
         return hits.any(axis=0)
     
     @staticmethod
-    def explode_circle_to_lines(circular_elements, segment_factor=5):
+    def explode_circle_to_lines(circular_elements, segment_factor=15):
         circular_elements = circular_elements.reset_index(drop=True)
+        segment_list: List[cudf.DataFrame] = []
         
         for i in range(len(circular_elements)):
             center_x = float(circular_elements.loc[i, 'start_x'])
             center_y = float(circular_elements.loc[i, 'start_y'])
+            arc_length =float(circular_elements.loc[i, 'length'])
             radius = float(circular_elements.loc[i, 'radius'])
             is_circle = int(circular_elements.loc[i, 'circle']) == 1
             start_angle = 0.0 if is_circle else float(circular_elements.loc[i, 'start_angle'])
             end_angle = 360.0 if is_circle else float(circular_elements.loc[i, 'end_angle'])
+            
+            print('radius')
+            print(radius)
+            
+            # Get the number of segments
+            angle = end_angle - start_angle
+            segments = int(cupy.ceil((arc_length * segment_factor) / 8).item())
+            segments = (segments + 7) & ~7
+            
+            print('segments')
+            print(segments)
+            
+            # Create angle segments
+            theta = cupy.linspace(start_angle, end_angle, segments + 1)
+            theta = cupy.radians(theta)
+            
+            # Compute coordinates for all segments
+            x = cupy.cos(theta) * radius + center_x
+            y = cupy.sin(theta) * radius + center_y
+            
+            x_start = x[:-1]
+            y_start = y[:-1]
+            x_end = x[1:]
+            y_end = y[1:]
+            
+            dx = x_end - x_start
+            dy = y_end - y_start
+            length = cupy.sqrt(dx**2 + dy**2)
+            angle = cupy.arctan2(dy, dx)
+            
+            parent_id = cupy.full_like(length, i)
+            
+            line_segments = cudf.DataFrame(
+                {
+                    'parent_id':parent_id,
+                    'start_x': x_start,
+                    'start_y': y_start,
+                    'end_x': x_end,
+                    'end_y': y_end,
+                    'length': length,
+                    'angle': angle,
+                }
+            )
+            
+            segment_list.append(line_segments)
         
-        
-        
-        
-        
-        
-        
-        
-        # Convert column data to CuPy arrays
-        center_x = cupy.asarray(circular_elements['start_x'].to_cupy())
-        center_y = cupy.asarray(circular_elements['start_y'].to_cupy())
-        radius = cupy.asarray(circular_elements['radius'].to_cupy())
-        is_circle = cupy.asarray(circular_elements['circle'].to_cupy())
-        start_angle = cupy.where(is_circle, 0, cupy.asarray(circular_elements['start_angle'].to_cupy()))
-        end_angle = cupy.where(is_circle, 360, cupy.asarray(circular_elements['end_angle'].to_cupy()))
-        
-        # Get the number of segments
-        segments = cupy.ceil((radius * 2 * segment_factor) / 8).astype(cupy.int32)
-        segments = (segments + 7) & (~7)  # Round up to nearest multiple of 8
-        
-        # Create angle segments
-        theta = cupy.linspace(start_angle, end_angle, segments + 1)
-        theta = cupy.radians(theta)
-        
-        # Compute coordinates for all segments
-        x = cupy.cos(theta) * radius[:, None] + center_x[:, None]
-        y = cupy.sin(theta) * radius[:, None] + center_y[:, None]
-        
-        x_start = x[:, :-1].reshape(-1)
-        y_start = y[:, :-1].reshape(-1)
-        x_end = x[:, 1:].reshape(-1)
-        y_end = y[:, 1:].reshape(-1)
-
-        dx = x_end - x_start
-        dy = y_end - y_start
-        length = cupy.sqrt(dx**2 + dy**2)
-        angle = cupy.arctan2(dy, dx)
-        
-        parent_id = cupy.repeat(cupy.arange(len(circular_elements)), segments - 1)
-        
-        line_segments = cudf.DataFrame(
-            {
-                'parent_id':parent_id,
-                'start_x': x_start,
-                'start_y': y_start,
-                'end_x': x_end,
-                'end_y': y_end,
-                'length': length,
-                'angle': angle,
-            }
-        )
-        
-        return line_segments
+        return cudf.concat(segment_list, ignore_index=True)
         
     def ParallelDetection(self, max_threshold=50, colinear_threshold=0.5,
                           min_overlap_ratio=0.2, angle_tolerance=cupy.radians(0.01)):
@@ -657,7 +655,7 @@ class Graph:
         
         # Compute OBBs
         obb_lines = self.create_obb(start_x, start_y, end_x, end_y, width=obb_width)
-        obb_circles = self.create_obb(circular_start_x, circular_start_y, circular_end_x, circular_end_y, width=obb_width)
+        obb_circles = self.create_obb(circular_start_x, circular_start_y, circular_end_x, circular_end_y, width=0.1)
         
         # SAT overlap
         pair = self.check_overlap_sat(obb_circles, obb_lines) # returns (N_circ, N_lines) mask
@@ -676,7 +674,7 @@ class Graph:
         q1 = cupy.stack([start_x[line_indices], start_y[line_indices]], axis=1)
         q2 = cupy.stack([end_x[line_indices], end_y[line_indices]], axis=1)
         
-        is_point_intersection = self.is_point_intersection(q1, q2, p1, p2, obb_width)
+        is_point_intersection = self.is_point_intersection(q1, q2, p1, p2, threshold=2.0)
         is_segment_intersection = ~is_point_intersection
         
         # DEBUG: Print counts
@@ -762,7 +760,6 @@ def LaplacianEigenvectors(graph, k=2):
 import ezdxf
 import torch
 import numpy
-import cudf
 from torch_geometric.data import Data
 
 def CreateGraph(dxf_file):
