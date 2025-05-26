@@ -1,10 +1,15 @@
-from typing import List
+from typing import List, Tuple
 import cupy
 import cudf
+import math
 from torch.utils.dlpack import from_dlpack
+from shapely.strtree import STRtree
+from shapely.geometry import LineString, Point
+from shapely.ops import nearest_points
+from pynvml import nvmlInit, nvmlDeviceGetHandleByIndex, nvmlDeviceGetMemoryInfo # DEBUG
 
 class Graph:
-    _edge_attributes = cupy.arange(10, dtype=cupy.int32)
+    _attributes = cupy.arange(10, dtype=cupy.int32)
     
     parallel = 0
     colinear = 1
@@ -17,7 +22,7 @@ class Graph:
     angle_difference_cos = 8
     perimeter_intersection = 9
     
-    def __init__(self, dataframe, edge_per_element=200):
+    def __init__(self, dataframe, edges_per_element=200):
         self._dataframe = dataframe
         
         start_x, start_y = dataframe['start_x'], dataframe['start_y']
@@ -61,12 +66,32 @@ class Graph:
             arc_flags
         ]).toDlpack())
         
-        edge_capacity = len(dataframe) * edge_per_element
+        edge_capacity = len(dataframe) * edges_per_element
         
-        self._size = 0
+        self.size = 0
         self.edges = cupy.empty((2, edge_capacity), dtype=cupy.int32)
-        self.edgeAttributes = cupy.empty((edge_capacity, len(self._edge_attributes)), dtype=cupy.float32)
-           
+        self.edgeAttributes = cupy.empty((edge_capacity, len(self._attributes)), dtype=cupy.float32)
+    
+    @staticmethod
+    def create_arc(center, radius, startAngle, endAngle, resolution=64):
+        
+        startAngle = math.radians(startAngle)
+        endAngle   = math.radians(endAngle)
+        angle = endAngle - startAngle
+        
+        if angle < 0: angle += 2*math.pi
+        
+        segments = math.ceil((angle / (2*math.pi))*resolution)
+        
+        points = []
+        step = angle / segments
+        for segment in range(segments+1):
+            stepAngle = startAngle + segment * step
+            px = center.x + radius * math.cos(stepAngle)
+            py = center.y + radius * math.sin(stepAngle)
+            points.append((px, py))
+        return points
+         
     @staticmethod
     def overlap_ratios(start_xA, start_yA, end_xA, end_yA, lengthA,
                        start_xB, start_yB, end_xB, end_yB, lengthB):
@@ -258,32 +283,6 @@ class Graph:
         return vector_a[:, 0] * vector_b[:, 1] - vector_a[:, 1] * vector_b[:, 0]
     
     @staticmethod
-    def intersection(p1, p2, q1, q2):
-        " Return the intersection points "
-        # Define vectors
-        va = p2 - p1
-        vb = q2 - q1
-        qp = q1 - p1
-        
-        denominator = Graph._cross(va, vb)
-        
-        # Avoid division by zero: mask where denom != 0
-        valid = denominator != 0
-        ta = cupy.zeros_like(denominator)
-        tb = cupy.zeros_like(denominator)
-        intersections = cupy.full_like(p1, cupy.nan)
-        
-        ta[valid] = Graph._cross(qp[valid], vb[valid]) / denominator[valid]
-        tb[valid] = Graph._cross(qp[valid], va[valid]) / denominator[valid]
-        
-        # Condition for segments intersecting
-        condition = (ta >= 0) & (ta <= 1) & (tb >= 0) & (tb <= 1) & valid
-        
-        # Compute intersection points only where condition is True
-        intersections[condition] = p1[condition] + ta[condition].reshape(-1, 1) * va[condition]
-        return intersections, condition
-    
-    @staticmethod
     def _point_to_segment_closest(p, a, b):
         """Returns the closest point on segment ab to point p."""
         ap = p - a
@@ -299,14 +298,17 @@ class Graph:
         return closest
     
     @staticmethod
-    def is_point_intersection(p1, p2, q1, q2, threshold):
+    def is_point_intersection_CPU(intersection, endpoints, threshold):
+        ix, iy = intersection
+        for ex, ey in endpoints:
+            distance = math.dist((ix, iy), (ex, ey))  # Euclidean distance
+            if distance <= threshold:
+                return True
+        return False
+    
+    @staticmethod
+    def is_point_intersection_GPU(p1, p2, q1, q2, threshold):
         batch_size = p1.shape[0]
-        
-        print('points being checked:')
-        print(p1)
-        print(p2)
-        print(q1)
-        print(q2)
         
         # Check p1 and p2 against q1–q2
         points = cupy.stack([p1, p2], axis=1).reshape(-1, 2) 
@@ -318,84 +320,23 @@ class Graph:
         distance_squared = cupy.sum((points - closest) ** 2, axis=1)
         hits = distance_squared <= threshold**2
         
-        # 🔍 Debug prints
-        print("---- is_point_intersection DEBUG ----")
-        print("threshold²:", threshold**2)
-        print("distance_squared[:10]:", distance_squared[:10].get().tolist())
-        print("hits[:10]:", hits[:10].get().tolist())
-        
         # Reshape hits to (2, batch_size)
         hits = hits.reshape(2, batch_size)
         
         return hits.any(axis=0)
-    
-    @staticmethod
-    def explode_circle_to_lines(circular_elements, segment_factor=15):
-        circular_elements = circular_elements.reset_index(drop=True)
-        segment_list: List[cudf.DataFrame] = []
-        
-        for i in range(len(circular_elements)):
-            center_x = float(circular_elements.loc[i, 'start_x'])
-            center_y = float(circular_elements.loc[i, 'start_y'])
-            arc_length =float(circular_elements.loc[i, 'length'])
-            radius = float(circular_elements.loc[i, 'radius'])
-            is_circle = int(circular_elements.loc[i, 'circle']) == 1
-            start_angle = 0.0 if is_circle else float(circular_elements.loc[i, 'start_angle'])
-            end_angle = 360.0 if is_circle else float(circular_elements.loc[i, 'end_angle'])
-            
-            print('radius')
-            print(radius)
-            
-            # Get the number of segments
-            angle = end_angle - start_angle
-            segments = int(cupy.ceil((arc_length * segment_factor) / 8).item())
-            segments = (segments + 7) & ~7
-            
-            print('segments')
-            print(segments)
-            
-            # Create angle segments
-            theta = cupy.linspace(start_angle, end_angle, segments + 1)
-            theta = cupy.radians(theta)
-            
-            # Compute coordinates for all segments
-            x = cupy.cos(theta) * radius + center_x
-            y = cupy.sin(theta) * radius + center_y
-            
-            x_start = x[:-1]
-            y_start = y[:-1]
-            x_end = x[1:]
-            y_end = y[1:]
-            
-            dx = x_end - x_start
-            dy = y_end - y_start
-            length = cupy.sqrt(dx**2 + dy**2)
-            angle = cupy.arctan2(dy, dx)
-            
-            parent_id = cupy.full_like(length, i)
-            
-            line_segments = cudf.DataFrame(
-                {
-                    'parent_id':parent_id,
-                    'start_x': x_start,
-                    'start_y': y_start,
-                    'end_x': x_end,
-                    'end_y': y_end,
-                    'length': length,
-                    'angle': angle,
-                }
-            )
-            
-            segment_list.append(line_segments)
-        
-        return cudf.concat(segment_list, ignore_index=True)
         
     def ParallelDetection(self, max_threshold=50, colinear_threshold=0.5,
                           min_overlap_ratio=0.2, angle_tolerance=cupy.radians(0.01)):
+        print("[DEBUG] Entered ParallelDetection")
         
         dataframe = self._dataframe.copy()
-        dataframe = dataframe[(dataframe['circle'] == 0) & (dataframe['arc'] == 0)]
-        dataframe['angle'] = dataframe['angle'] % cupy.pi  # collapse symmetrical directions
+        
+        # Filter valid line indices
+        is_line = (dataframe['circle'] == 0) & (dataframe['arc'] == 0)
+        lines = dataframe[is_line].reset_index(drop=True)
+        lines['angle'] = lines['angle'] % cupy.pi  # collapse symmetrical directions
+        
+        print("[DEBUG] lines shape:", lines.shape)
         
         # bin settings
         bin_factor = 10**5
@@ -403,19 +344,21 @@ class Graph:
         bin_angle_size = cupy.radians(0.25)
         
         # Extract coordinates
-        start_x = dataframe['start_x'].to_cupy()
-        start_y = dataframe['start_y'].to_cupy()
-        end_x = dataframe['end_x'].to_cupy()
-        end_y = dataframe['end_y'].to_cupy()
-        length = dataframe['length'].to_cupy()
-        angle = dataframe['angle'].to_cupy()
-        offset = dataframe['offset'].to_cupy()
-        max_length = self._dataframe['length'].to_cupy().max()
+        start_x = lines['start_x'].to_cupy()
+        start_y = lines['start_y'].to_cupy()
+        end_x = lines['end_x'].to_cupy()
+        end_y = lines['end_y'].to_cupy()
+        length = lines['length'].to_cupy()
+        angle = lines['angle'].to_cupy()
+        offset = lines['offset'].to_cupy()
+        max_length = dataframe['length'].to_cupy().max()
         
         angle_bin = cupy.floor(angle / bin_angle_size).astype(cupy.int32)
         offset_bin = cupy.floor(offset / bin_offset_size).astype(cupy.int32)
         element_keys = angle_bin * bin_factor + offset_bin
         bin_keys = cupy.unique(element_keys)
+        
+        print("[DEBUG] binning done, angle_bin shape:", angle_bin.shape)
         
         for key in bin_keys:
             angle_key = key // bin_factor
@@ -439,17 +382,19 @@ class Graph:
             subset_angle = angle[element_indices]
             subset_offset = offset[element_indices]
             
+            print("[DEBUG] Preparing to concatenate edges or attributes")
             coordinates = cupy.stack([subset_angle, subset_offset], axis=1)
             
             difference_matrix = coordinates[:, None, :] - coordinates[None, :, :]
             distance_squared = cupy.sum(difference_matrix**2, axis=-1)
             pairs = (distance_squared <= max_threshold**2) & cupy.triu(cupy.ones_like(distance_squared, dtype=bool), k=1)
+            print("[DEBUG] candidate pairs:", pairs.shape)
             i, j = cupy.where(pairs)
             
             if i.size == 0: continue
             
-            # Retrieve true angles from self._dataframe before mod % π
-            original_angle = self._dataframe['angle'].to_cupy()[element_indices]
+            # Retrieve true angles from dataframe before mod % π
+            original_angle = dataframe['angle'].to_cupy()[element_indices]
             angle_i = original_angle[i]
             angle_j = original_angle[j]
             angle_difference = cupy.abs(angle_i - angle_j)
@@ -485,19 +430,44 @@ class Graph:
             offset_i = subset_offset[i]
             offset_j = subset_offset[j]
             
-            distance = cupy.abs(offset_j - offset_i) / cupy.cos(angle_i)
+            angle_difference = angle_difference[i]
+            angle_difference_min = angle_difference_min[i]
             
+            distance = cupy.abs(offset_j - offset_i) / cupy.cos(angle_i)
+            print("[DEBUG] Preparing to concatenate edges or attributes")
             edges_ij = cupy.stack([element_indices[i], element_indices[j]], axis=0)
+            print("[DEBUG] edges_ij shape:", edges_ij.shape)
             edges_ji = cupy.stack([element_indices[j], element_indices[i]], axis=0)
+            print("[DEBUG] edges_ji shape:", edges_ji.shape)
+            
+            try:
+                edges = cupy.concatenate([edges_ij, edges_ji], axis=1)
+                print("[DEBUG] edges concatenated successfully:", edges.shape)
+            except Exception as e:
+                print("[ERROR] cupy.concatenate failed:", e)
+                raise
+            
+            print("[DEBUG] Preparing to concatenate edges or attributes")
             edges = cupy.concatenate([edges_ij, edges_ji], axis=1)
             
-            attributes = cupy.zeros((i.shape[0], len(self._edge_attributes)), dtype=cupy.float32)
+            print("[DEBUG] i.shape:", i.shape)
+            print("[DEBUG] self._attributes:", self._attributes)
+            print("[DEBUG] self._attributes size:", self._attributes.size)
+            
+            attributes = cupy.zeros((i.shape[0], len(self._attributes)), dtype=cupy.float32)
+            print("[DEBUG] attributes initialized:", attributes.shape)
             attributes[:, self.parallel] = 1.0
+            print("[DEBUG] parallel filled")
             attributes[:, self.colinear] = (distance < colinear_threshold).astype(cupy.float32)
+            print("[DEBUG] colinear filled")
             attributes[:, self.perpendicular_distance] = distance / max_length
+            print("[DEBUG] perpendicular filled")
             attributes[:, self.angle_difference] = angle_difference_min / (cupy.pi / 2)
+            print("[DEBUG] angle diff filled")
             attributes[:, self.angle_difference_sin] = cupy.sin(angle_difference)
+            print("[DEBUG] sin filled")
             attributes[:, self.angle_difference_cos] = cupy.cos(angle_difference)
+            print("[DEBUG] cos filled")
             
             attributes_ij = attributes.copy()
             attributes_ij[:, self.overlap_ratio] = overlapA
@@ -505,15 +475,28 @@ class Graph:
             attributes_ji = attributes.copy()
             attributes_ji[:, self.overlap_ratio] = overlapB
             
+            print("[DEBUG] Preparing to concatenate edges or attributes")
             attributes = cupy.concatenate([attributes_ij, attributes_ji], axis=0)
             
-            start = self._size
+            start = self.size
             end = start + edges.shape[1]
             self.edges[:, start:end] = edges
             self.edgeAttributes[start:end, :] = attributes
-            self._size = end
+            self.size = end
+            print("[DEBUG] Exiting ParallelDetection with edge count:", self.size)
                         
     def IntersectionDetection(self, obb_width=0.5, co_linear_tolerance=cupy.radians(0.01)):
+        print("[DEBUG] Starting IntersectionDetection")
+        
+        nvmlInit()
+        handle = nvmlDeviceGetHandleByIndex(0)
+        info = nvmlDeviceGetMemoryInfo(handle)
+        print(f"[DEBUG] GPU Memory: used = {info.used // 1024**2} MB, free = {info.free // 1024**2} MB")
+        
+        
+        
+        
+        
         dataframe = self._dataframe.copy()
         
         # bin settings
@@ -537,7 +520,9 @@ class Graph:
         angle = lines['angle'].to_cupy()
         
         # Compute line midpoints and OBBs
+        print(f"[DEBUG] GPU Memory: used = {info.used // 1024**2} MB, free = {info.free // 1024**2} MB")
         obbs = self.create_obb(start_x, start_y, end_x, end_y, width=obb_width)
+        print(f"[DEBUG] GPU Memory: used = {info.used // 1024**2} MB, free = {info.free // 1024**2} MB")
         obb_centroids = obbs.mean(axis=1)
         mid_x = obb_centroids[:, 0]
         mid_y = obb_centroids[:, 1]
@@ -581,6 +566,7 @@ class Graph:
                 
                 # SAT check
                 overlap = self.check_overlap_sat(obbs_i, obbs_j)
+                overlap = cupy.diag(overlap)
                 indices_i = indices_i[overlap]
                 indices_j = indices_j[overlap]
                 
@@ -605,8 +591,8 @@ class Graph:
                 q1 = cupy.stack([start_x[indices_j], start_y[indices_j]], axis=1)
                 q2 = cupy.stack([end_x[indices_j], end_y[indices_j]], axis=1)
                 
-                is_point_intersection_ij = self.is_point_intersection(p1, p2, q1, q2, obb_width)
-                is_point_intersection_ji = self.is_point_intersection(q1, q2, p1, p2, obb_width)
+                is_point_intersection_ij = self.is_point_intersection_GPU(p1, p2, q1, q2, threshold=obb_width)
+                is_point_intersection_ji = self.is_point_intersection_GPU(q1, q2, p1, p2, threshold=obb_width)
                 is_segment_intersection_ij = ~is_point_intersection_ij
                 is_segment_intersection_ji = ~is_point_intersection_ji
                 
@@ -617,7 +603,7 @@ class Graph:
                 edges = cupy.concatenate([edges_ij, edges_ji], axis=1)
                 num_edges = i_nodes.shape[0]
                 
-                attributes = cupy.zeros((num_edges, len(self._edge_attributes)), dtype=cupy.float32)
+                attributes = cupy.zeros((num_edges, len(self._attributes)), dtype=cupy.float32)
                 attributes[:, self.angle_difference] = angle_difference_min / (cupy.pi / 2)
                 attributes[:, self.angle_difference_sin] = cupy.sin(angle_difference)
                 attributes[:, self.angle_difference_cos] = cupy.cos(angle_difference)
@@ -632,102 +618,87 @@ class Graph:
                 
                 attributes = cupy.concatenate([attributes_ij, attributes_ji], axis=0)
                 
-                start = self._size
+                start = self.size
                 end = start + edges.shape[1]
                 self.edges[:, start:end] = edges
                 self.edgeAttributes[start:end, :] = attributes
-                self._size = end
+                self.size = end
         
         if len(circular_elements) == 0: return
         
-        # Explode circular elements into line segments with parent_id
-        exploded = self.explode_circle_to_lines(circular_elements)
+        dataframe = dataframe.to_pandas()
+        lines = lines.to_pandas()
+        circular_elements = circular_elements.to_pandas()
+
+        geometryLines: List[Tuple[int, LineString]] = []
+        for i, row in lines.iterrows():
+            line = LineString([(row["start_x"], row["start_y"]), (row["end_x"], row["end_y"])])
+            geometryLines.append((i, line))
+
+        geometryCircular: List[Tuple[int, LineString]] = []
+        for i, row in circular_elements.iterrows():
+            center = Point(row["start_x"], row["start_y"])
+            radius = row["radius"]
+            if row["circle"]:
+                circle = center.buffer(radius).boundary
+                geometryCircular.append((i, circle))
+            else:
+                startAngle = row["start_angle"]
+                endAngle = row["end_angle"]
+                arcPoints = self.create_arc(center, radius, startAngle, endAngle)
+                arc = LineString(arcPoints)
+                geometryCircular.append((i, arc))
+                
+        # Build STRtree for lines
+        space2D = STRtree([geometry for _, geometry in geometryLines])
+
+        edges: List[Tuple[int, int]] = []
+        attributes: List[List[float]] = []
+        # Circle-line perimeter intersections
+        for i, circularElement in geometryCircular:
+            nearbyLines = space2D.query(circularElement.buffer(threshold:=obb_width))
+            
+            for k in nearbyLines:
+                j, line = geometryLines[k]
+                
+                # Check actual intersection
+                intersection = circularElement.intersection(line)
+                if intersection.is_empty:
+                    if circularElement.distance(line) < threshold:
+                        pA, pB = nearest_points(circularElement, line)
+                        intersection_x, intersection_y = (pA.x + pB.x) / 2, (pA.y + pB.y) / 2
+                        intersection = Point(intersection_x, intersection_y)
+                    else: continue
+                
+                # Ensure intersection is always stored as a point
+                if intersection.geom_type == "Point": intersection = (intersection.x, intersection.y)
+                elif intersection.geom_type == "MultiPoint":intersection = list(intersection.geoms)[0].coords[0]
+                else: intersection = intersection.interpolate(0.5, normalized=True).coords[0]
+                
+                row = dataframe.iloc[j]
+                rowPoints = [(row["start_x"], row["start_y"]), (row["end_x"], row["end_y"])]
+                isPointIntersection = self.is_point_intersection_CPU(intersection, rowPoints, threshold)
+                
+                edges.append((i, j))
+                attributes_ij = [0.0] * len(self._attributes)
+                attributes_ij[self.perimeter_intersection] = 1
+                attributes.append(attributes_ij)
+                
+                edges.append((j, i))
+                attributes_ji = [0.0] * len(self._attributes)
+                attributes_ji[self.point_intersection] = 1 if isPointIntersection else 0
+                attributes_ji[self.segment_intersection] = 0 if isPointIntersection else 1
+                attributes.append(attributes_ji)
         
-        lines = lines.reset_index(drop=True)
-        exploded = exploded.reset_index(drop=True)
+        edges = cupy.asarray(edges).T
+        attributes = cupy.asarray(attributes)
         
-        # Create CuPy arrays from circular segments
-        circular_start_x = exploded['start_x'].to_cupy()
-        circular_start_y = exploded['start_y'].to_cupy()
-        circular_end_x = exploded['end_x'].to_cupy()
-        circular_end_y = exploded['end_y'].to_cupy()
-        circular_parent_id = exploded['parent_id'].to_cupy()
-        
-        # Compute OBBs
-        obb_lines = self.create_obb(start_x, start_y, end_x, end_y, width=obb_width)
-        obb_circles = self.create_obb(circular_start_x, circular_start_y, circular_end_x, circular_end_y, width=0.1)
-        
-        # SAT overlap
-        pair = self.check_overlap_sat(obb_circles, obb_lines) # returns (N_circ, N_lines) mask
-        circular_indices, line_indices = cupy.where(pair)
-        
-        # DEBUG:
-        print("OBB Overlap Matrix Shape:", pair.shape)
-        print("Num Overlaps Found:", pair.sum().item())
-        print("Overlap Sample Indices:", list(zip(*cupy.where(pair)))[:10])
-        
-        if circular_indices.size == 0: return # No matches
-        
-        # Extract coordinates for segment intersection (per exploded segment)
-        p1 = cupy.stack([circular_start_x[circular_indices], circular_start_y[circular_indices]], axis=1)
-        p2 = cupy.stack([circular_end_x[circular_indices], circular_end_y[circular_indices]], axis=1)
-        q1 = cupy.stack([start_x[line_indices], start_y[line_indices]], axis=1)
-        q2 = cupy.stack([end_x[line_indices], end_y[line_indices]], axis=1)
-        
-        is_point_intersection = self.is_point_intersection(q1, q2, p1, p2, threshold=2.0)
-        is_segment_intersection = ~is_point_intersection
-        
-        # DEBUG: Print counts
-        print("Total overlapping segments:", len(is_point_intersection))
-        print("Point intersections:", cupy.sum(is_point_intersection).item())
-        print("Segment intersections (by ~point):", cupy.sum(~is_point_intersection).item())
-        
-        
-        # Get (circle, line) pair for each segment
-        circles = circular_parent_id[circular_indices]  # circular element ID (original)
-        lines = cupy.asarray(line_indices, dtype=cupy.int32)
-        pairs = cupy.stack([circles, lines], axis=1)
-        
-        # Unique pairs with inverse index mapping
-        pairs, indices = cupy.unique(pairs, axis=0, return_inverse=True)
-        num_pairs = pairs.shape[0]
-        
-        # Aggregate flags: if any segment hits, mark the type
-        is_point_intersection = cupy.bincount(indices, weights=is_point_intersection.view(cupy.int8), minlength=num_pairs) > 0
-        is_segment_intersection = cupy.bincount(indices, weights=is_segment_intersection.view(cupy.int8), minlength=num_pairs) > 0
-        
-        is_point_intersection = is_point_intersection.astype(cupy.bool_)
-        is_segment_intersection = is_segment_intersection.astype(cupy.bool_)
-        
-        # Decompose unique pairs
-        circles = pairs[:, 0]
-        lines = pairs[:, 1]
-        
-        # Prepare edge attributes for both directions (circle → line, line → circle)
-        num_edges = circles.shape[0]
-        attributes = cupy.zeros((num_edges, len(self._edge_attributes)), dtype=cupy.float32)
-        
-        attributes_circle_line = attributes.copy()
-        attributes_circle_line[:, self.perimeter_intersection] = 1.0
-        
-        attributes_line_circle = attributes.copy()
-        attributes_line_circle[:, self.point_intersection] = is_point_intersection.astype(cupy.float32)
-        attributes_line_circle[:, self.segment_intersection] = is_segment_intersection.astype(cupy.float32)
-        
-        # Build edges
-        edge_circle_line = cupy.stack([circles, lines], axis=0)
-        edge_line_circle = cupy.stack([lines, circles], axis=0)
-        
-        edges = cupy.concatenate([edge_circle_line, edge_line_circle], axis=1)
-        attributes = cupy.concatenate([attributes_circle_line, attributes_line_circle], axis=0)
-        
-        # Store into the graph
-        start = self._size
+        start = self.size
         end = start + edges.shape[1]
         self.edges[:, start:end] = edges
         self.edgeAttributes[start:end, :] = attributes
-        self._size = end
-                         
+        self.size = end
+            
 from torch_geometric.utils import to_scipy_sparse_matrix
 from scipy.sparse import csgraph
 from scipy.sparse.linalg import eigsh, ArpackNoConvergence
