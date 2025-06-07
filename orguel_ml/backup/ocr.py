@@ -1,5 +1,5 @@
 
-def __get_characters():
+def _get_characters():
     # Set your character set
     character_set = {
                         "characters": {
@@ -29,175 +29,342 @@ def __get_characters():
     
     return character_set
 
-character_set = __get_characters()
+character_set = _get_characters()
 width_factors = (0.8, 1.0, 1.2)
+rotations= [i * 15 for i in range(24)]
+scales = [0.5*i for i in range(14, 60)] + [5*i for i in range(6, 21)]
 
-import numpy
-from typing import List, Tuple
+import cupy
+from torch.utils.dlpack import from_dlpack
 from .orguel_ml import Graph as BaseGraph
 
 class Graph(BaseGraph):
-    __edge_attributes = {
-                            "parallel": 0,
-                            "colinear": 0,
-                            "perpendicular_distance": 0,
-                            "overlap_ratio": 0,
-                            "point_intersection": 0,
-                            "segment_intersection": 0,
-                            "angle_difference": 0
-                        }
-    def __init__(self, dataframe):
-        self.__dataframe = dataframe
+    _attributes = cupy.arange(9, dtype=cupy.int32)
+    
+    parallel = 0
+    colinear = 1
+    perpendicular_distance = 2
+    overlap_ratio = 3
+    point_intersection = 4
+    segment_intersection = 5
+    angle_difference = 6
+    angle_difference_sin = 7
+    angle_difference_cos = 8
+    
+    def __init__(self, dataframe, normalization_factor, edges_per_element=200):
+        self._dataframe = dataframe
         
-        coordinates_x = dataframe[['start_x', 'end_x', 'cluster_insertion_x']]
-        coordinates_y = dataframe[['start_y', 'end_y', 'cluster_insertion_y']]
+        character_height = dataframe['character_height']
+        character_width = dataframe['character_width']
+        character_insertion_x = dataframe['character_insertion_x']
+        character_insertion_y = dataframe['character_insertion_y']
+        start_x, start_y = dataframe['start_x'], dataframe['start_y']
+        end_x, end_y = dataframe['end_x'], dataframe['end_y']
+        length = dataframe['length']
+        angle = dataframe['angle']
         
-        normalizedCoordinates = dataframe[['start_x', 'start_y', 'end_x', 'end_y']].copy()
-        normalizedCoordinates[['start_x', 'end_x']] = (normalizedCoordinates[['start_x', 'end_x']] - coordinates_x.values.mean()) / coordinates_x.values.std()
-        normalizedCoordinates[['start_y', 'end_y']] = (normalizedCoordinates[['start_y', 'end_y']] - coordinates_y.values.mean()) / coordinates_y.values.std()
+        # Normalize coordinates
+        coordinates_x = cupy.concatenate([start_x.to_cupy(), end_x.to_cupy(), character_insertion_x.to_cupy()])
+        coordinates_y = cupy.concatenate([start_y.to_cupy(), end_y.to_cupy(), character_insertion_y.to_cupy()])
         
-        normalizedAngles = numpy.column_stack((numpy.sin(dataframe['angle']), numpy.cos(dataframe['angle'])))
-        normalizedLengths = dataframe[['length']] / 176.53671467337412
+        start_x_normalized = (start_x - coordinates_x.mean()) / coordinates_x.std()
+        start_y_normalized = (start_y - coordinates_y.mean()) / coordinates_y.std()
+        end_x_normalized = (end_x - coordinates_x.mean()) / coordinates_x.std()
+        end_y_normalized = (end_y - coordinates_y.mean()) / coordinates_y.std()
         
-        cluster = dataframe.groupby("cluster_id")
+        coordinates_normalized = cupy.stack([start_x_normalized.to_cupy(), start_y_normalized.to_cupy(),
+                                            end_x_normalized.to_cupy(), end_y_normalized.to_cupy()], axis=1)
+        
+        # Normalize angles
+        angles_normalized = cupy.stack([cupy.sin(angle.to_cupy()), cupy.cos(angle.to_cupy())], axis=1)
+        
+        # Normalize length and character dimensions
+        if normalization_factor: normalizationFactor = normalization_factor
+        else: normalizationFactor = cupy.max(cupy.stack([length.to_cupy(), character_height.to_cupy(), character_width.to_cupy()], axis=1))
+        
+        lengths_normalized = (length / normalizationFactor).to_cupy().reshape(-1, 1)
+        character_heigth_normalized = (character_height / normalizationFactor)
+        character_width_normalized = (character_width / normalizationFactor)
+        
+        characters = dataframe.groupby("character_id")
+        
+        insertion_x_normalized = (characters['character_insertion_x'].first().values - coordinates_x.mean()) / coordinates_x.std()
+        insertion_y_normalized = (characters['character_insertion_y'].first().values - coordinates_y.mean()) / coordinates_y.std()
         
         self.classificationLabels = {
-            "label": cluster['cluster_label'].first().values,
-            "font": cluster['cluster_font'].first().values
+            "type": from_dlpack(cupy.asarray(characters['character_type'].first().values).toDlpack()),
+            "font": from_dlpack(cupy.asarray(characters['character_font'].first().values).toDlpack())
         }
+        
         self.regressionTargets = {
-            "height": cluster['cluster_height'].first().values / 176.53671467337412,
-            "rotation": cluster['cluster_rotation'].first().values,
-            "insertion_x": ((cluster['cluster_insertion_x'].first() - coordinates_x.values.mean()) / coordinates_x.values.std()).values,
-            "insertion_y": ((cluster['cluster_insertion_y'].first() - coordinates_y.values.mean()) / coordinates_y.values.std()).values
+            "height": from_dlpack(cupy.asarray(character_heigth_normalized.groupby(dataframe['character_id']).first().values).toDlpack()),
+            "width": from_dlpack(cupy.asarray(character_width_normalized.groupby(dataframe['character_id']).first().values).toDlpack()),
+            "rotation": from_dlpack(cupy.asarray(characters['character_rotation'].first().values).toDlpack()),
+            "insertion_x": from_dlpack(cupy.asarray(insertion_x_normalized).toDlpack()),
+            "insertion_y": from_dlpack(cupy.asarray(insertion_y_normalized).toDlpack())
         }
-        self.nodesAttributes = numpy.hstack([normalizedCoordinates.values, normalizedAngles, normalizedLengths.values])
-        self.edges: List[Tuple[int, int]] = []
-        self.edgesAttributes: List[List[float]] = []
+        
+        self.nodeAttributes = from_dlpack(cupy.hstack([coordinates_normalized, angles_normalized, lengths_normalized]).toDlpack())
+        
+        edge_capacity = len(dataframe) * edges_per_element
+        
+        self.size = 0
+        self.edges = cupy.empty((2, edge_capacity), dtype=cupy.int32)
+        self.edgeAttributes = cupy.empty((edge_capacity, len(self._attributes)), dtype=cupy.float32)
 
-from typing import Dict
-import os
 import math
-import pandas
+import numpy
 import ezdxf
+import cudf
 import torch
-from scipy.spatial import cKDTree
 from torch_geometric.data import Data
+from shapely.affinity import rotate as shapely_rotate
+from shapely.affinity import scale as shapely_scale
+from .orguel_ml import LaplacianEigenvectors
 
-def CreateGraph(dxf_file, spacing=500, cluster_radius=200, character_set=character_set):
+def rotate_and_scale(x, y, angle, scale):
+    angle_rad = math.radians(angle)
+    x_aligned = x * scale * math.cos(angle_rad) - y * scale * math.sin(angle_rad)
+    y_aligned = x * scale * math.sin(angle_rad) + y * scale * math.cos(angle_rad)
+    return x_aligned, y_aligned
+
+def _expand_quads(quads, epsilon=0.05):
+    centroid = quads.mean(axis=1, keepdims=True)
+    direction = quads - centroid  # vector from center to corner
+    direction_normalized = cupy.linalg.norm(direction, axis=2, keepdims=True) + 1e-12  # avoid divide-by-zero
+    unit = direction / direction_normalized
+    quads_expanded = quads + unit * epsilon
+    return quads_expanded
+
+def find_character_lines(centroid_x, centroid_y, quads):
     
-    # Load DXF
-    fileName = os.path.basename(dxf_file)
-    fontName = fileName.split("_")[0]
-    height = float(fileName.split("_height")[-1].split("_local")[0].split("_global")[0].replace(".dxf", "").replace("_", "."))
-    rotation = float(fileName.split("_local")[-1].split("_global")[-1].replace(".dxf", "").replace("_", ".")) if 'local' in fileName or 'global' in fileName else 0
+    # Expand quads slightly to catch edge points
+    quads = _expand_quads(quads)
+    
+    cx, cy = centroid_x, centroid_y
+    
+    N = cx.shape[0]
+    M = quads.shape[0]
+
+    # Expand to shape (N, M, 1)
+    cx = cx[:, None, None]
+    cy = cy[:, None, None]
+
+    # (M, 4, 2) → (1, M, 4, 2)
+    vertices = quads[None, :, :, :]
+
+    xv = vertices[:, :, :, 0]  # shape (1, M, 4)
+    yv = vertices[:, :, :, 1]
+
+    xv1 = cupy.roll(xv, -1, axis=2)
+    yv1 = cupy.roll(yv, -1, axis=2)
+
+    # Check if edge crosses ray (horizontal to right)
+    condition1 = ((yv <= cy) & (yv1 > cy)) | ((yv > cy) & (yv1 <= cy))
+    slope = (xv1 - xv) / (yv1 - yv + 1e-12)
+    intersect_x = xv + slope * (cy - yv)
+    condition2 = cx < intersect_x
+
+    crossings = (condition1 & condition2).sum(axis=2) % 2 == 1  # Ray crossing parity rule
+
+    matches = cupy.argwhere(crossings)
+    return matches
+
+def CreateGraph(dxf_file, character_positions, rotation=0, scale=1.0, normalization_factor=None):
+    # Filter only rows for this dxf file
+    characterPositions = character_positions[character_positions['file'] == dxf_file].copy()
+    characterPositions = characterPositions.reset_index(drop=False)
+    
+    # Apply transform to bbox and insertion point
+    for i, row in characterPositions.iterrows():
+        bboxAligned = shapely_rotate(row['bbox'], angle=rotation, origin=(0, 0), use_radians=False)
+        bboxAligned = shapely_scale(bboxAligned, xfact=scale, yfact=scale, origin=(0, 0))
+        characterPositions.at[i, 'bbox'] = bboxAligned
+        
+        insertion_x, insertion_y = row['insertion']
+        aligned_insertion_x, aligned_insertion_y = rotate_and_scale(insertion_x, insertion_y, rotation, scale)
+        characterPositions.at[i, 'insertion'] = (aligned_insertion_x, aligned_insertion_y)
+        
+        characterPositions.at[i, 'height'] = row['height'] * scale
+        characterPositions.at[i, 'width'] = row['width'] * scale
+        characterPositions.at[i, 'rotation'] = (row['rotation'] + math.radians(rotation)) % (2 * math.pi)
     
     doc = ezdxf.readfile(dxf_file)
     modelSpace = doc.modelspace()
     lineCollector = [line for line in modelSpace if line.dxftype() == 'LINE']
     
-    # Extract centroids and full line geometry
-    dataframe: List[Dict] = []
-    centroids: List[Tuple[float, float]] = []
-    for line in lineCollector:
-        start_x, start_y, _ = line.dxf.start
-        end_x, end_y, _ = line.dxf.end
-        centroid = ((start_x + end_x) / 2, (start_y + end_y) / 2)
-        
-        length = math.hypot(end_x - start_x, end_y - start_y)
-        angle = math.atan2(end_y - start_y, end_x - start_x) % math.pi
-        
-        nlen = math.hypot(start_y - end_y, end_x - start_x)
-        offset = 0.0 if nlen < 1e-12 else abs(start_x * ((start_y - end_y) / nlen) + start_y * ((end_x - start_x) / nlen))
-        
-        centroids.append(centroid)
-        dataframe.append(
-            {
-                "cluster_id": 0,
-                "cluster_font": character_set["font"]["encoding"][fontName],
-                "cluster_height": height,
-                "cluster_rotation": rotation / 360,
-                "cluster_label": 0,
-                "cluster_insertion_x": 0,
-                "cluster_insertion_y":0,
-                "start_x": start_x,
-                "start_y": start_y,
-                "end_x": end_x,
-                "end_y": end_y,
-                "length": length,
-                "angle": angle,
-                "offset": offset,
-                "circle": 0,
-                "arc": 0,
-                "radius": 0,
-                "start_angle": 0,
-                "end_angle": 0
-            }
-        )
-
-    # Build KDTree for spatial lookup
-    space2D = cKDTree(centroids)
+    if not lineCollector: return
     
-    # Cluster lines based on known insertion points
-    id=0
-    y=0
-    for group, characters in character_set["characters"]["type"].items():
-        x=50
-        for character in characters:
-            insertionPoint = (x, y)
-            if "_global" in fileName: insertionPoint = __rotate_around_origin(x, y, rotation)
-            
-            clusterIndexes = space2D.query_ball_point(insertionPoint, cluster_radius)
-            for i in clusterIndexes:
-                dataframe[i]["cluster_id"] = id
-                dataframe[i]["cluster_label"] = character_set["characters"]["encoding"][character]
-                dataframe[i]["cluster_insertion_x"] = insertionPoint[0]
-                dataframe[i]["cluster_insertion_y"] = insertionPoint[1]
-            
-            id += 1
-            x += spacing
-        y -= spacing
-                
-    dataframe = pandas.DataFrame(dataframe)
+    count = len(lineCollector)
     
-    graph = Graph(dataframe)
-    graph.ParallelDetection()
+    character_id = numpy.zeros(count, dtype=numpy.int8)
+    character_font = numpy.zeros(count, dtype=numpy.int8)
+    character_type = numpy.zeros(count, dtype=numpy.int8)
+    character_height = numpy.zeros(count, dtype=numpy.float32)
+    character_width = numpy.zeros(count, dtype=numpy.float32)
+    character_rotation = numpy.zeros(count, dtype=numpy.float32)
+    character_insertion_x = numpy.zeros(count, dtype=numpy.float32)
+    character_insertion_y = numpy.zeros(count, dtype=numpy.float32)
+    start_x = numpy.zeros(count, dtype=numpy.float32)
+    start_y = numpy.zeros(count, dtype=numpy.float32)
+    end_x = numpy.zeros(count, dtype=numpy.float32)
+    end_y = numpy.zeros(count, dtype=numpy.float32)
+    length = numpy.zeros(count, dtype=numpy.float32)
+    angle = numpy.zeros(count, dtype=numpy.float32)
+    layer = numpy.empty(count, dtype=object)
+    circle_flag = numpy.zeros(count, dtype=numpy.int8)
+    arc_flag = numpy.zeros(count, dtype=numpy.int8)
+    radius = numpy.zeros(count, dtype=numpy.float32)
+    start_angle = numpy.zeros(count, dtype=numpy.float32)
+    end_angle = numpy.zeros(count, dtype=numpy.float32)
+    
+    for i, line in enumerate(lineCollector):
+        layer[i] = line.dxf.layer
+        
+        sx, sy, _ = line.dxf.start
+        ex, ey, _ = line.dxf.end
+        
+        sx, sy = rotate_and_scale(sx, sy, rotation, scale)
+        ex, ey = rotate_and_scale(ex, ey, rotation, scale)
+        
+        dx, dy = ex - sx, ey - sy
+        
+        start_x[i], start_y[i] = sx, sy
+        end_x[i], end_y[i] = ex, ey
+        length[i] = numpy.hypot(dx, dy)
+        angle[i] = numpy.arctan2(dy, dx) % (2*numpy.pi)
+    
+    dataframe = cudf.DataFrame(
+        {
+            "character_id": cupy.asarray(character_id),
+            "character_font": cupy.asarray(character_font),
+            "character_type": cupy.asarray(character_type),
+            "character_height": cupy.asarray(character_height),
+            "character_width": cupy.asarray(character_width),
+            "character_rotation": cupy.asarray(character_rotation),
+            "character_insertion_x": cupy.asarray(character_insertion_x),
+            "character_insertion_y": cupy.asarray(character_insertion_y),
+            "start_x": cupy.asarray(start_x),
+            "start_y": cupy.asarray(start_y),
+            "end_x": cupy.asarray(end_x),
+            "end_y": cupy.asarray(end_y),
+            "length": cupy.asarray(length),
+            "angle": cupy.asarray(angle),
+            "layer": layer,
+            "circle": cupy.asarray(circle_flag),
+            "arc": cupy.asarray(arc_flag),
+            "radius": cupy.asarray(radius),
+            "start_angle": cupy.asarray(start_angle),
+            "end_angle": cupy.asarray(end_angle)
+        }
+    )
+    
+    # Extract line centroids
+    centroid_x, centroid_y = (start_x + end_x) / 2, (start_y + end_y) / 2
+    centroid_x, centroid_y = cupy.asarray(centroid_x), cupy.asarray(centroid_y)
+    
+    # Build the CuPy stack *and* remember which DF row each quad is.
+    quads = cupy.stack([ cupy.asarray(polygon.exterior.coords[:4], dtype=cupy.float32)
+                            for polygon in characterPositions['bbox']])
+    
+    # Run the GPU matcher
+    character_lines = find_character_lines(centroid_x, centroid_y, quads)
+    
+    # Use quad_indices to translate quad-position → DataFrame row
+    for line, quad in character_lines:
+        line, quad = int(line), int(quad)
+        row = characterPositions.iloc[quad]
+        character_id[line] = row.name # original character id
+        character_font[line] = character_set['font']['encoding'].get(row['font'], 0)
+        character_type[line] = character_set['characters']['encoding'].get(row['character'], 0)
+        character_height[line] = row['height']
+        character_width[line] = row['width']
+        character_rotation[line]= row['rotation'] / (2 * math.pi)
+        character_insertion_x[line] = row['insertion'][0]
+        character_insertion_y[line] = row['insertion'][1]
+    
+    # Define anchor point
+    anchor_x = cupy.float32(dataframe[['start_x', 'end_x']].to_cupy().min().item() - 100000)
+    anchor_y = cupy.float32(dataframe[['start_y', 'end_y']].to_cupy().min().item() - 100000)
+    
+    # Compute offset
+    start_x, start_y, end_x, end_y = dataframe['start_x'], dataframe['start_y'], dataframe['end_x'], dataframe['end_y']
+    
+    # Set a safe length (to avoid division by zero)
+    mask = (dataframe["circle"] == 0) & (dataframe["arc"] == 0) & (dataframe["length"] > 1e-12)
+    length = dataframe["length"].where(mask, 1.0)
+    
+    # Perpendicular offset (same formula, but mask invalid ones to zero)
+    offset = cupy.abs((start_x - anchor_x) * (-(end_y - start_y) / length) +
+                      (start_y - anchor_y) * ((end_x - start_x) / length))
+    
+    # Apply masking: invalid offsets get zero
+    offset = cupy.where(mask.to_cupy(), offset, 0.0)
+    
+    # Assign back
+    dataframe["offset"] = offset
+    
+    graph = Graph(dataframe, normalization_factor)
+    
+    graph.ParallelDetection(max_threshold=7.5)
     graph.IntersectionDetection()
     
-    # Convert all tensors
-    graph.classificationLabels = {
-        "label": torch.tensor(graph.classificationLabels["label"], dtype=torch.long),
-        "font": torch.tensor(graph.classificationLabels["font"], dtype=torch.long)
-    }
-    
-    graph.regressionTargets = {
-        "height": torch.tensor(graph.regressionTargets["height"], dtype=torch.float),
-        "rotation": torch.tensor(graph.regressionTargets["rotation"], dtype=torch.float),
-        "insertion_x": torch.tensor(graph.regressionTargets["insertion_x"], dtype=torch.float),
-        "insertion_y": torch.tensor(graph.regressionTargets["insertion_y"], dtype=torch.float)
-    }
+    # 🐛 Debug block right here:
+    print("[DEBUG] graph.edges type:", type(graph.edges))
+    print("[DEBUG] graph.edges dtype:", graph.edges.dtype)
+    print("[DEBUG] graph.edges shape:", graph.edges.shape)
+    print("[DEBUG] graph.size:", graph.size, "type:", type(graph.size))
 
-    graph.nodesAttributes = torch.tensor(graph.nodesAttributes, dtype=torch.float)
-    graph.edges = torch.tensor(graph.edges, dtype=torch.long).t().contiguous()
-    graph.edgesAttributes = torch.tensor(graph.edgesAttributes, dtype=torch.float)
+    valid = int(graph.size)
+    print("[DEBUG] graph.edges[:, :valid].shape:", graph.edges[:, :valid].shape)
+    
+    graph.edges = torch.tensor(cupy.asnumpy(graph.edges[:, :graph.size]), dtype=torch.long).t().contiguous()
+    graph.edgeAttributes = torch.tensor(cupy.asnumpy(graph.edgeAttributes[:graph.size]), dtype=torch.float)
     
     # Create PyG Data object with everything
     graph = Data(
-        x=graph.nodesAttributes,
+        x=graph.nodeAttributes,
         edge_index=graph.edges,
-        edge_attr=graph.edgesAttributes,
-        y=graph.classificationLabels["label"],
+        edge_attr=graph.edgeAttributes,
+        y=graph.classificationLabels["type"],
         font=graph.classificationLabels["font"],
         height=graph.regressionTargets["height"],
+        width=graph.regressionTargets["width"],
         rotation=graph.regressionTargets["rotation"],
         insertion_x=graph.regressionTargets["insertion_x"],
         insertion_y=graph.regressionTargets["insertion_y"],
-        cluster_id=torch.tensor(dataframe["cluster_id"].values, dtype=torch.long)
+        character_id=torch.tensor(cupy.asnumpy(dataframe["character_id"]), dtype=torch.long)
     )
-
-    #graph: Data = LaplacianEigenvectors(graph)
     
+    #graph: Data = LaplacianEigenvectors(graph, k=4)
+
     return graph
+
+import os
+from tqdm import tqdm
+from multiprocessing import Pool
+
+def CreateGraphWorker(args):
+    print(f"[DEBUG] Calling CreateGraph with: {args[0]}")
+    return CreateGraph(*args)
+
+class CreateGraphDataset(torch.utils.data.Dataset):
+    def __init__(self, arguments, chunksize=4):
+        self.graphs = []
+        #with Pool(processes=os.cpu_count()) as pool:
+            #for graph in tqdm(pool.imap_unordered(CreateGraphWorker, arguments, chunksize=chunksize),
+            #                  total=len(arguments),
+            #                  desc="Creating graphs"):
+            #    self.graphs.append(graph)
+        for args in tqdm(arguments, desc="Creating graphs"): #DEBUG
+            print(f"Processing: {args[0]}") #DEBUG
+            self.graphs.append(CreateGraphWorker(args)) #DEBUG
+    
+    def __len__(self):
+        return len(self.graphs)
+    
+    def __getitem__(self, idx):
+        return self.graphs[idx]
 
 import torch.nn as nn
 import torch.nn.functional as F

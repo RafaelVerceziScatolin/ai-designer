@@ -28,6 +28,7 @@ conda install -c pytorch -c nvidia pytorch torchvision torchaudio pytorch-cuda=1
 conda install -c conda-forge pytorch-lightning tensorboard
 conda install -c pyg pyg
 conda install -c pyg -c conda-forge torch-scatter
+conda install -c conda-forge pynvml
 pip install tqdm_joblib
 pip uninstall cupy
 pip install cupy-cuda12x -f https://pip.cupy.dev

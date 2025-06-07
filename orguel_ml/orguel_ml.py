@@ -239,42 +239,108 @@ class Graph:
     
     @staticmethod
     def _get_axes(corners):
+        print("[DEBUG] _get_axes corners shape:", corners.shape)
         # Returns the two edge directions as axes to test (unit vectors)
         edge1 = corners[:, 1] - corners[:, 0]
-        edge2 = corners[:, 3] - corners[:, 0] 
-        axes = cupy.stack([edge1, edge2], axis=1) 
+        edge2 = corners[:, 3] - corners[:, 0]
+        print("[DEBUG] edge1 shape:", edge1.shape)
+        print("[DEBUG] edge2 shape:", edge2.shape)
+        
+        axes = cupy.stack([edge1, edge2], axis=1)
+        print("[DEBUG] stacked axes shape:", axes.shape)
         lengths = cupy.linalg.norm(axes, axis=2, keepdims=True)
+        print("[DEBUG] lengths shape:", lengths.shape)
+        
         return axes / lengths
     
     @staticmethod
     def _project(corners, axes):
-        return cupy.einsum('...ij,...kj->...ki', corners, axes)
+        print("[DEBUG] _project corners shape:", corners.shape)
+        print("[DEBUG] _project axes shape:", axes.shape)
+        projections = cupy.einsum('nij,nkj->nik', corners, axes)
+        print("[DEBUG] _project projections shape:", projections.shape)
+        return projections
     
     @staticmethod
     def check_overlap_sat(obbs_a, obbs_b):
-        
+        print("[DEBUG] Entering check_overlap_sat")
+        print("[DEBUG] obbs_a shape:", obbs_a.shape)
+        print("[DEBUG] obbs_b shape:", obbs_b.shape)
+         
         Na, Nb = obbs_a.shape[0], obbs_b.shape[0]
         
-        # build every pair as a flat list
-        pairs_a = obbs_a[:, None, :, :].repeat(Nb, axis=1).reshape(-1, 4, 2)
-        pairs_b = obbs_b[None, :, :, :].repeat(Na, axis=0).reshape(-1, 4, 2)
+        # Compute AABBs (Axis-Aligned Bounding Boxes)
+        min_x_a = obbs_a[..., 0].min(axis=1)
+        max_x_a = obbs_a[..., 0].max(axis=1)
+        min_y_a = obbs_a[..., 1].min(axis=1)
+        max_y_a = obbs_a[..., 1].max(axis=1)
+
+        min_x_b = obbs_b[..., 0].min(axis=1)
+        max_x_b = obbs_b[..., 0].max(axis=1)
+        min_y_b = obbs_b[..., 1].min(axis=1)
+        max_y_b = obbs_b[..., 1].max(axis=1)
+        
+        # Computing AABB intersection matrix
+        print("[DEBUG] Computing AABB intersection matrix")
+        aabb_x = (min_x_a[:, None] <= max_x_b[None, :]) & (max_x_a[:, None] >= min_x_b[None, :])
+        aabb_y = (min_y_a[:, None] <= max_y_b[None, :]) & (max_y_a[:, None] >= min_y_b[None, :])
+        aabb_overlap = aabb_x & aabb_y
+        print("[DEBUG] AABB_overlap shape:", aabb_overlap.shape)
+        pairs = cupy.argwhere(aabb_overlap)
+        
+        print("[DEBUG] aabb_overlap type:", type(aabb_overlap))
+        print("[DEBUG] aabb_overlap shape:", aabb_overlap.shape if isinstance(aabb_overlap, cupy.ndarray) else "invalid")
+        
+        if pairs.shape[0] == 0: cupy.zeros((Na, Nb), dtype=bool)
+        
+        i, j = pairs[:, 0], pairs[:, 1]
+        
+        pairs_a, pairs_b = obbs_a[i], obbs_b[j]
+        
+        print("[DEBUG] pairs_a shape:", pairs_a.shape)
+        print("[DEBUG] pairs_b shape:", pairs_b.shape)
         
         # axes per box
+        print("[DEBUG] Computing axes...")
         axes_a = Graph._get_axes(pairs_a)
         axes_b = Graph._get_axes(pairs_b)
         axes = cupy.concatenate([axes_a, axes_b], axis=1)
+        print("[DEBUG] axes shape:", axes.shape)
         
         # project & SAT
+        print("[DEBUG] Projecting...")
         projections_a = Graph._project(pairs_a, axes)
         projections_b = Graph._project(pairs_b, axes)
+        print("[DEBUG] projections_a shape:", projections_a.shape)
+        print("[DEBUG] projections_b shape:", projections_b.shape)
+        
+        if projections_a.shape != projections_b.shape:
+            print("[DEBUG] Shape mismatch detected, dumping pair indices and exiting...")
+            print("[DEBUG] i shape:", i.shape)
+            print("[DEBUG] j shape:", j.shape)
+            print("[DEBUG] axes shape:", axes.shape)
+            print("[DEBUG] projections_a:", projections_a)
+            print("[DEBUG] projections_b:", projections_b)
+            raise ValueError(f"Shape mismatch: projections_a {projections_a.shape}, projections_b {projections_b.shape}")
+        
+        max_a = projections_a.max(2)
+        min_b = projections_b.min(2)
+        max_b = projections_b.max(2)
+        min_a = projections_a.min(2)
+
+        print("[DEBUG] max_a shape:", max_a.shape)
+        print("[DEBUG] min_b shape:", min_b.shape)
+        print("[DEBUG] max_b shape:", max_b.shape)
+        print("[DEBUG] min_a shape:", min_a.shape)
         
         separating_axis = (projections_a.max(2) < projections_b.min(2)) |\
                           (projections_b.max(2) < projections_a.min(2))
         
-        overlap = ~cupy.any(separating_axis, axis=1)
+        overlap = cupy.zeros((Na, Nb), dtype=bool)
+        overlap[i, j] = ~cupy.any(separating_axis, axis=1)
         
-        # reshape back -> (Na, Nb)
-        overlap = overlap.reshape(Na, Nb)
+        print("[DEBUG] overlap shape:", overlap.shape)
+        print("[DEBUG] Exiting check_overlap_sat")
         
         return overlap
          
@@ -308,26 +374,20 @@ class Graph:
     
     @staticmethod
     def is_point_intersection_GPU(p1, p2, q1, q2, threshold):
-        batch_size = p1.shape[0]
         
-        # Check p1 and p2 against q1–q2
-        points = cupy.stack([p1, p2], axis=1).reshape(-1, 2) 
-        q1 = cupy.repeat(q1, 2, axis=0)
-        q2 = cupy.repeat(q2, 2, axis=0)
+        # Compute closest points for both p1 and p2 to segment q1–q2
+        closest_1 = Graph._point_to_segment_closest(p1, q1, q2)
+        closest_2 = Graph._point_to_segment_closest(p2, q1, q2)
         
-        # Compute closest points on each segment
-        closest = Graph._point_to_segment_closest(points, q1, q2)
-        distance_squared = cupy.sum((points - closest) ** 2, axis=1)
-        hits = distance_squared <= threshold**2
+        distance_1 = cupy.sum((p1 - closest_1) ** 2, axis=1)
+        distance_2 = cupy.sum((p2 - closest_2) ** 2, axis=1)
         
-        # Reshape hits to (2, batch_size)
-        hits = hits.reshape(2, batch_size)
+        hits = (distance_1 <= threshold**2) | (distance_2 <= threshold**2)
         
-        return hits.any(axis=0)
+        return hits
         
     def ParallelDetection(self, max_threshold=50, colinear_threshold=0.5,
                           min_overlap_ratio=0.2, angle_tolerance=cupy.radians(0.01)):
-        print("[DEBUG] Entered ParallelDetection")
         
         dataframe = self._dataframe.copy()
         
@@ -335,8 +395,6 @@ class Graph:
         is_line = (dataframe['circle'] == 0) & (dataframe['arc'] == 0)
         lines = dataframe[is_line].reset_index(drop=True)
         lines['angle'] = lines['angle'] % cupy.pi  # collapse symmetrical directions
-        
-        print("[DEBUG] lines shape:", lines.shape)
         
         # bin settings
         bin_factor = 10**5
@@ -357,8 +415,6 @@ class Graph:
         offset_bin = cupy.floor(offset / bin_offset_size).astype(cupy.int32)
         element_keys = angle_bin * bin_factor + offset_bin
         bin_keys = cupy.unique(element_keys)
-        
-        print("[DEBUG] binning done, angle_bin shape:", angle_bin.shape)
         
         for key in bin_keys:
             angle_key = key // bin_factor
@@ -382,13 +438,11 @@ class Graph:
             subset_angle = angle[element_indices]
             subset_offset = offset[element_indices]
             
-            print("[DEBUG] Preparing to concatenate edges or attributes")
             coordinates = cupy.stack([subset_angle, subset_offset], axis=1)
             
             difference_matrix = coordinates[:, None, :] - coordinates[None, :, :]
             distance_squared = cupy.sum(difference_matrix**2, axis=-1)
             pairs = (distance_squared <= max_threshold**2) & cupy.triu(cupy.ones_like(distance_squared, dtype=bool), k=1)
-            print("[DEBUG] candidate pairs:", pairs.shape)
             i, j = cupy.where(pairs)
             
             if i.size == 0: continue
@@ -434,40 +488,17 @@ class Graph:
             angle_difference_min = angle_difference_min[i]
             
             distance = cupy.abs(offset_j - offset_i) / cupy.cos(angle_i)
-            print("[DEBUG] Preparing to concatenate edges or attributes")
             edges_ij = cupy.stack([element_indices[i], element_indices[j]], axis=0)
-            print("[DEBUG] edges_ij shape:", edges_ij.shape)
             edges_ji = cupy.stack([element_indices[j], element_indices[i]], axis=0)
-            print("[DEBUG] edges_ji shape:", edges_ji.shape)
-            
-            try:
-                edges = cupy.concatenate([edges_ij, edges_ji], axis=1)
-                print("[DEBUG] edges concatenated successfully:", edges.shape)
-            except Exception as e:
-                print("[ERROR] cupy.concatenate failed:", e)
-                raise
-            
-            print("[DEBUG] Preparing to concatenate edges or attributes")
             edges = cupy.concatenate([edges_ij, edges_ji], axis=1)
             
-            print("[DEBUG] i.shape:", i.shape)
-            print("[DEBUG] self._attributes:", self._attributes)
-            print("[DEBUG] self._attributes size:", self._attributes.size)
-            
             attributes = cupy.zeros((i.shape[0], len(self._attributes)), dtype=cupy.float32)
-            print("[DEBUG] attributes initialized:", attributes.shape)
             attributes[:, self.parallel] = 1.0
-            print("[DEBUG] parallel filled")
             attributes[:, self.colinear] = (distance < colinear_threshold).astype(cupy.float32)
-            print("[DEBUG] colinear filled")
             attributes[:, self.perpendicular_distance] = distance / max_length
-            print("[DEBUG] perpendicular filled")
             attributes[:, self.angle_difference] = angle_difference_min / (cupy.pi / 2)
-            print("[DEBUG] angle diff filled")
             attributes[:, self.angle_difference_sin] = cupy.sin(angle_difference)
-            print("[DEBUG] sin filled")
             attributes[:, self.angle_difference_cos] = cupy.cos(angle_difference)
-            print("[DEBUG] cos filled")
             
             attributes_ij = attributes.copy()
             attributes_ij[:, self.overlap_ratio] = overlapA
@@ -475,7 +506,6 @@ class Graph:
             attributes_ji = attributes.copy()
             attributes_ji[:, self.overlap_ratio] = overlapB
             
-            print("[DEBUG] Preparing to concatenate edges or attributes")
             attributes = cupy.concatenate([attributes_ij, attributes_ji], axis=0)
             
             start = self.size
@@ -483,20 +513,18 @@ class Graph:
             self.edges[:, start:end] = edges
             self.edgeAttributes[start:end, :] = attributes
             self.size = end
-            print("[DEBUG] Exiting ParallelDetection with edge count:", self.size)
                         
     def IntersectionDetection(self, obb_width=0.5, co_linear_tolerance=cupy.radians(0.01)):
         print("[DEBUG] Starting IntersectionDetection")
         
         nvmlInit()
         handle = nvmlDeviceGetHandleByIndex(0)
-        info = nvmlDeviceGetMemoryInfo(handle)
-        print(f"[DEBUG] GPU Memory: used = {info.used // 1024**2} MB, free = {info.free // 1024**2} MB")
-        
-        
-        
-        
-        
+        def print_gpu_mem(label):
+            info = nvmlDeviceGetMemoryInfo(handle)
+            print(f"[DEBUG GPU] {label}: used = {info.used // 1024**2} MB, free = {info.free // 1024**2} MB")
+
+        print_gpu_mem("At start")
+
         dataframe = self._dataframe.copy()
         
         # bin settings
@@ -520,20 +548,28 @@ class Graph:
         angle = lines['angle'].to_cupy()
         
         # Compute line midpoints and OBBs
-        print(f"[DEBUG] GPU Memory: used = {info.used // 1024**2} MB, free = {info.free // 1024**2} MB")
         obbs = self.create_obb(start_x, start_y, end_x, end_y, width=obb_width)
-        print(f"[DEBUG] GPU Memory: used = {info.used // 1024**2} MB, free = {info.free // 1024**2} MB")
+        print_gpu_mem("After OBB creation")
+        print_gpu_mem("Before OBB mean")
         obb_centroids = obbs.mean(axis=1)
+        print("[DEBUG] obb_centroids shape:", obb_centroids.shape)
         mid_x = obb_centroids[:, 0]
         mid_y = obb_centroids[:, 1]
+        print("[DEBUG] mid_x shape:", mid_x.shape)
         
         # Hilbert sort and dynamic binning
+        print_gpu_mem("Before hilbert_sort")
         hilbert_order = self.hilbert_sort(mid_x, mid_y)
+        print("[DEBUG] hilbert_order shape:", hilbert_order.shape)
         num_bins = max(min_num_bins, int(len(lines) / lines_per_bin))
+        print("[DEBUG] num_bins:", num_bins)
+        print_gpu_mem("Before create_bins")
         bins_matrix, bin_counts = self.create_bins(hilbert_order, num_bins=num_bins)
+        print("[DEBUG] bins_matrix shape:", bins_matrix.shape)
         
         # Define neighbor depth based on percentage of total bins
         neighbor_depth = max(min_neighbor_deph, int(num_bins * depth_percentage))
+        print("[DEBUG] neighbor_depth:", neighbor_depth)
         
         # Step 2: Check pairwise overlaps within bins and neighbor bins (forward only)
         for bin_i in range(num_bins):
@@ -541,15 +577,21 @@ class Graph:
                 bin_j = bin_i + offset
                 if bin_j >= num_bins: continue
                 
+                print(f"[DEBUG] Checking bin pair: ({bin_i}, {bin_j})")
+                
                 indices_i = bins_matrix[bin_i]
                 indices_j = bins_matrix[bin_j]
 
                 indices_i = indices_i[indices_i != -1]
                 indices_j = indices_j[indices_j != -1]
                 
+                print(f"[DEBUG] bin_i size: {indices_i.size}, bin_j size: {indices_j.size}")
+                print_gpu_mem("Before meshgrid")
+                
                 if indices_i.shape[0] == 0 or indices_j.shape[0] == 0: continue
                 
                 indices_i, indices_j = cupy.meshgrid(indices_i, indices_j, indexing='ij')
+                print_gpu_mem("After meshgrid")
                 indices_i = indices_i.flatten()
                 indices_j = indices_j.flatten()
                 
@@ -558,17 +600,25 @@ class Graph:
                 indices_i = indices_i[valid]
                 indices_j = indices_j[valid]
                 
+                print(f"[DEBUG] Valid pairs after flattening: {indices_i.size}")
+                print_gpu_mem("Before obb slicing")
+                
                 if indices_i.shape[0] == 0: continue
                 
                 # Extract OBBs and coordinates
                 obbs_i = obbs[indices_i]
                 obbs_j = obbs[indices_j]
                 
+                print("[DEBUG] obbs_i shape:", obbs_i.shape)
+                print("[DEBUG] obbs_j shape:", obbs_j.shape)
+                print_gpu_mem("Before check_overlap_sat")
+                
                 # SAT check
                 overlap = self.check_overlap_sat(obbs_i, obbs_j)
-                overlap = cupy.diag(overlap)
-                indices_i = indices_i[overlap]
-                indices_j = indices_j[overlap]
+                print_gpu_mem("After check_overlap_sat")
+                overlap = cupy.argwhere(overlap)
+                indices_i = indices_i[overlap[:, 0]]
+                indices_j = indices_j[overlap[:, 1]]
                 
                 if indices_i.shape[0] == 0: continue
                 
@@ -585,14 +635,23 @@ class Graph:
                 angle_difference = angle_difference[colinear]
                 angle_difference_min = angle_difference_min[colinear]
                 
+                print_gpu_mem("Before segment intersection")
+                
                 # Segment intersection
                 p1 = cupy.stack([start_x[indices_i], start_y[indices_i]], axis=1)
                 p2 = cupy.stack([end_x[indices_i], end_y[indices_i]], axis=1)
                 q1 = cupy.stack([start_x[indices_j], start_y[indices_j]], axis=1)
                 q2 = cupy.stack([end_x[indices_j], end_y[indices_j]], axis=1)
                 
+                print("[DEBUG] p1 shape:", p1.shape)
+                print("[DEBUG] q1 shape:", q1.shape)
+                
+                print("[DEBUG] Starting is_point_intersection_ij")
                 is_point_intersection_ij = self.is_point_intersection_GPU(p1, p2, q1, q2, threshold=obb_width)
+                print("[DEBUG] Finished is_point_intersection_ij")
+                print("[DEBUG] Starting is_point_intersection_ji")
                 is_point_intersection_ji = self.is_point_intersection_GPU(q1, q2, p1, p2, threshold=obb_width)
+                print("[DEBUG] Finished is_point_intersection_ji")
                 is_segment_intersection_ij = ~is_point_intersection_ij
                 is_segment_intersection_ji = ~is_point_intersection_ji
                 
@@ -602,6 +661,8 @@ class Graph:
                 edges_ji = cupy.stack([j_nodes, i_nodes], axis=0)
                 edges = cupy.concatenate([edges_ij, edges_ji], axis=1)
                 num_edges = i_nodes.shape[0]
+                
+                print_gpu_mem("Before attribute allocation")
                 
                 attributes = cupy.zeros((num_edges, len(self._attributes)), dtype=cupy.float32)
                 attributes[:, self.angle_difference] = angle_difference_min / (cupy.pi / 2)
@@ -618,11 +679,19 @@ class Graph:
                 
                 attributes = cupy.concatenate([attributes_ij, attributes_ji], axis=0)
                 
+                print("[DEBUG] Writing edges and attributes")
+                print(f"[DEBUG] self.size: {self.size}")
+                print(f"[DEBUG] edges.shape: {edges.shape}")
+                print(f"[DEBUG] attributes.shape: {attributes.shape}")
+                print(f"[DEBUG] self.edges shape: {self.edges.shape}")
+                print(f"[DEBUG] self.edgeAttributes shape: {self.edgeAttributes.shape}")
+                
                 start = self.size
                 end = start + edges.shape[1]
                 self.edges[:, start:end] = edges
                 self.edgeAttributes[start:end, :] = attributes
                 self.size = end
+                print_gpu_mem("After writing edges and attributes")
         
         if len(circular_elements) == 0: return
         
