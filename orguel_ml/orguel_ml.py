@@ -43,6 +43,7 @@ parallel=colinear=perpendicular_distance=overlap_ratio=point_intersection=segmen
 angle_difference=angle_difference_sin=angle_difference_cos=perimeter_intersection=None
 
 import torch
+from torch import newaxis
 
 class Graph:
     def __init__(self, dataframe):
@@ -77,8 +78,92 @@ class Graph:
         # Node attributes
         self.nodeAttributes = torch.hstack([normalized_coordinates, normalized_angle,
                                             normalized_length, circle_flag, arc_flag])
+    
+    @staticmethod
+    def create_obb(start_x, start_y, end_x, end_y, width, length_extension=True):
+        # Compute line directions and lengths
+        dx = end_x - start_x
+        dy = end_y - start_y
+        length = torch.sqrt(dx**2 + dy**2) + 1e-8 # sum 1e-8 to prevent division by zero
+
+        # Unit direction vectors
+        ux = dx / length
+        uy = dy / length
+
+        # Perpendicular vectors (unit)
+        perp_x = -uy
+        perp_y = ux
+
+        # Half dimensions
+        half_width = width / 2
+        half_length = (length / 2)
+        if length_extension: half_length += half_width
+
+        # Midpoints of the lines
+        mid_x = (start_x + end_x) / 2
+        mid_y = (start_y + end_y) / 2
         
-    def ParallelDetection(self):
+        dx_length, dy_length = ux * half_length, uy * half_length
+        dx_width, dy_width = perp_x * half_width, perp_y * half_width
+
+        # Corners (4 per OBB)
+        corner1_x = mid_x - dx_length - dx_width
+        corner1_y = mid_y - dy_length - dy_width
+
+        corner2_x = mid_x + dx_length - dx_width
+        corner2_y = mid_y + dy_length - dy_width
+
+        corner3_x = mid_x + dx_length + dx_width
+        corner3_y = mid_y + dy_length + dy_width
+
+        corner4_x = mid_x - dx_length + dx_width
+        corner4_y = mid_y - dy_length + dy_width
+
+        # Stack corners: shape (n_lines, 4, 2)
+        obb = torch.stack([
+            torch.stack([corner1_x, corner1_y], axis=1),
+            torch.stack([corner2_x, corner2_y], axis=1),
+            torch.stack([corner3_x, corner3_y], axis=1),
+            torch.stack([corner4_x, corner4_y], axis=1)
+        ], axis=1)
+
+        return obb
+    
+    @staticmethod
+    def check_overlap_sat(obbs):
+        
+        n_lines = obbs.shape[0]
+        
+        # Compute AABBs (Axis-Aligned Bounding Boxes)
+        min_x = obbs[..., 0].min(axis=1)[0]
+        max_x = obbs[..., 0].max(axis=1)[0]
+        min_y = obbs[..., 1].min(axis=1)[0]
+        max_y = obbs[..., 1].max(axis=1)[0]
+        
+        # Computing AABB intersection matrix
+        mask_x = (min_x[:, newaxis] <= max_x[newaxis, :]) & (min_x[newaxis, :] <= max_x[:, newaxis])
+        mask_y = (min_y[:, newaxis] <= max_y[newaxis, :]) & (min_y[newaxis, :] <= max_y[:, newaxis])
+
+        aabb_overlap = mask_x & mask_y
+        
+        pairs = torch.argwhere(aabb_overlap) # shape (n_pairs, 2)
+        
+        i, j = pairs[:, 0], pairs[:, 1]
+        
+        # Remove self-overlaps and lower triangle (e.g., keep only i < j)
+        mask = ~((i == j) | (i > j))
+        
+        i, j = i[mask], j[mask]
+        obbs_i, obbs_j = obbs[i], obbs[j]
+    
+    
+    
+    
+    
+    
+    
+    
+    def ParallelDetection(self, max_offset=25):
         dataframe = self._dataframe.copy()
         globals().update(_dataframe_field.__members__)
         
@@ -87,30 +172,40 @@ class Graph:
         lines = dataframe[:, mask]
         lines[angle] = lines[angle] % torch.pi # collapse symmetrical directions
         
-        # bin settings
-        bin_offset_size = 25
-        bin_angle_size = 0.25 * torch.pi/180
+        # Extract coordinates
+        start_x = lines[start_x]
+        start_y = lines[start_y]
+        end_x = lines[end_x]
+        end_y = lines[end_y]
         
-        angle_bin_key = torch.floor(lines[angle] / bin_angle_size).to(torch.int32)
-        offset_bin_key = torch.floor(lines[offset] / bin_offset_size).to(torch.int32)
-        offset_bin_key -= offset_bin_key.min() # remove void
+        # Compute line midpoints and OBBs
+        obbs = self.create_obb(start_x, start_y, end_x, end_y, width=max_offset, length_extension=False)
         
-        bin_hash = angle_bin_key * (offset_bin_key.max() + 1) + offset_bin_key
+        # SAT check
+        overlap = self.check_overlap_sat(obbs, obbs)
         
-        # Sort by bin
-        sorted_hash, original_index = torch.sort(bin_hash)
         
-        # Mask sorted hash to separate unique bins
-        mask = torch.hstack([torch.tensor([True], device='cuda'), sorted_hash[1:]!=sorted_hash[:-1]])
-        unique_bins = sorted_hash[mask]
         
-        # Get the start and end indices for each bin
-        bin_start = torch.where(mask)[0]
-        bin_end = torch.hstack([bin_start[1:], torch.tensor([len(sorted_hash)], device='cuda')])
         
-        # Split the hash key into angle and offset
-        unique_angle_bin_key = unique_bins // (offset_bin_key.max() + 1)
-        unique_offset_bin_key = unique_bins % (offset_bin_key.max() + 1)
+        
+        
+        
+        
+        
+        offset_tolerance = 25
+        angle_tolerance = 0.25 * torch.pi/180
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
         
         
         
@@ -187,7 +282,7 @@ def CreateGraph(dxf_file):
             dataframe[end_angle,i] = ea
     
     # Define anchor point
-    anchor_x = dataframe[[start_x, end_x]].min() - 100000
+    anchor_x = dataframe[[start_x, end_x]].min() - 50000
     anchor_y = dataframe[[start_y, end_y]].min() - 100000
     
     # Compute offset
