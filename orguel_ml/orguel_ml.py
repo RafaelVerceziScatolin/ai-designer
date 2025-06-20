@@ -9,19 +9,18 @@ class _dataframe_field(IntEnum):
     end_y = 4
     length = 5
     angle = 6
-    offset = 7
-    circle_flag = 8
-    arc_flag = 9
-    radius = 10
-    start_angle = 11
-    end_angle = 12
+    ux = 7
+    uy = 8
+    nx = 9
+    ny = 10
+    circle_flag = 11
+    arc_flag = 12
+    radius = 13
+    start_angle = 14
+    end_angle = 15
     
     @classmethod
     def count(cls) -> int: return len(cls)
-
-# Suppress IDE warnings
-index=start_x=start_y=end_x=end_y=length=angle=offset=\
-circle_flag=arc_flag=radius=start_angle=end_angle=None
 
 class _edge_attribute(IntEnum):
     parallel = 0
@@ -38,22 +37,18 @@ class _edge_attribute(IntEnum):
     @classmethod
     def count(cls) -> int: return len(cls)
 
-# Suppress IDE warnings
-parallel=colinear=perpendicular_distance=overlap_ratio=point_intersection=segment_intersection=\
-angle_difference=angle_difference_sin=angle_difference_cos=perimeter_intersection=None
-
 import torch
 from torch import newaxis
 
 class Graph:
-    def __init__(self, dataframe):
-        self._dataframe = dataframe
-        globals().update(_dataframe_field.__members__)
+    def __init__(self, dataframe:torch.Tensor):
         
-        start_x, start_y = dataframe[start_x], dataframe[start_y]
-        end_x, end_y = dataframe[end_x], dataframe[end_y]
-        length = dataframe[length]
-        angle = dataframe[angle]
+        F = _dataframe_field
+        
+        start_x, start_y = dataframe[F.start_x], dataframe[F.start_y]
+        end_x, end_y = dataframe[F.end_x], dataframe[F.end_y]
+        length = dataframe[F.length]
+        angle = dataframe[F.angle]
         
         # Normalize coordinates
         coordinates_x = torch.hstack([start_x, end_x])
@@ -72,40 +67,35 @@ class Graph:
         normalized_length = (length / length.max()).reshape([-1, 1]) # shape (N, 1)
         
         # Flags
-        circle_flag = dataframe[circle_flag].reshape([-1, 1]) # shape (N, 1)
-        arc_flag = dataframe[arc_flag].reshape([-1, 1]) # shape (N, 1)
+        circle_flag = dataframe[F.circle_flag].reshape([-1, 1]) # shape (N, 1)
+        arc_flag = dataframe[F.arc_flag].reshape([-1, 1]) # shape (N, 1)
         
         # Node attributes
         self.nodeAttributes = torch.hstack([normalized_coordinates, normalized_angle,
                                             normalized_length, circle_flag, arc_flag])
+        
+        self._dataframe = dataframe
     
     @staticmethod
-    def create_obb(start_x, start_y, end_x, end_y, width, length_extension=True):
-        # Compute line directions and lengths
-        dx = end_x - start_x
-        dy = end_y - start_y
-        length = torch.sqrt(dx**2 + dy**2) + 1e-8 # sum 1e-8 to prevent division by zero
-
-        # Unit direction vectors
-        ux = dx / length
-        uy = dy / length
-
-        # Perpendicular vectors (unit)
-        perp_x = -uy
-        perp_y = ux
-
+    def create_obb(lines:torch.Tensor, width:float, length_extension=True) -> torch.Tensor:
+        
+        F = _dataframe_field
+        
         # Half dimensions
         half_width = width / 2
-        half_length = (length / 2)
+        half_length = (lines[F.length] / 2)
         if length_extension: half_length += half_width
-
-        # Midpoints of the lines
-        mid_x = (start_x + end_x) / 2
-        mid_y = (start_y + end_y) / 2
         
-        dx_length, dy_length = ux * half_length, uy * half_length
-        dx_width, dy_width = perp_x * half_width, perp_y * half_width
-
+        # Midpoints of the lines
+        mid_x = (lines[F.start_x] + lines[F.end_x]) / 2
+        mid_y = (lines[F.start_y] + lines[F.end_y]) / 2
+        
+        # Compute displacements
+        dx_length = lines[F.ux] * half_length
+        dy_length = lines[F.uy] * half_length
+        dx_width = lines[F.nx] * half_width
+        dy_width = lines[F.ny] * half_width
+        
         # Corners (4 per OBB)
         corner1_x = mid_x - dx_length - dx_width
         corner1_y = mid_y - dy_length - dy_width
@@ -118,8 +108,8 @@ class Graph:
 
         corner4_x = mid_x - dx_length + dx_width
         corner4_y = mid_y - dy_length + dy_width
-
-        # Stack corners: shape (n_lines, 4, 2)
+        
+        # Stack corners
         obb = torch.stack([
             torch.stack([corner1_x, corner1_y], axis=1),
             torch.stack([corner2_x, corner2_y], axis=1),
@@ -127,10 +117,10 @@ class Graph:
             torch.stack([corner4_x, corner4_y], axis=1)
         ], axis=1)
 
-        return obb
+        return obb # Shape (n_lines, 4, 2)
     
     @staticmethod
-    def check_overlap_sat(obbs):
+    def check_overlap_sat(obbs:torch.Tensor):
         
         n_lines = obbs.shape[0]
         
@@ -163,14 +153,29 @@ class Graph:
     
     
     
-    def ParallelDetection(self, max_offset=25):
-        dataframe = self._dataframe.copy()
-        globals().update(_dataframe_field.__members__)
+    def ParallelDetection(self, offset=25):
+        F = _dataframe_field
+        dataframe = self._dataframe
         
         # Filter valid line indices
-        mask = (dataframe[circle_flag] == 0) & (dataframe[arc_flag] == 0)
-        lines = dataframe[:, mask]
-        lines[angle] = lines[angle] % torch.pi # collapse symmetrical directions
+        is_line = (dataframe[F.circle_flag] == 0) & (dataframe[F.arc_flag] == 0)
+        lines = dataframe[:, is_line]
+        lines[F.angle] = lines[F.angle] % torch.pi # collapse symmetrical directions
+        
+        # Compute OBBs
+        obbs = self.create_obb(lines, width=offset, length_extension=False)
+        
+        # SAT check
+        overlap = self.check_overlap_sat(obbs)
+        
+        
+        
+        
+        
+        
+        
+        
+        
         
         # Extract coordinates
         start_x = lines[start_x]
@@ -178,8 +183,8 @@ class Graph:
         end_x = lines[end_x]
         end_y = lines[end_y]
         
-        # Compute line midpoints and OBBs
-        obbs = self.create_obb(start_x, start_y, end_x, end_y, width=max_offset, length_extension=False)
+        # Compute OBBs
+        obbs = self.create_obb(start_x, start_y, end_x, end_y, width=offset, length_extension=False)
         
         # SAT check
         overlap = self.check_overlap_sat(obbs, obbs)
@@ -220,13 +225,6 @@ class Graph:
         
         
         
-        
-
-
-
-
-
-
 
 
 import ezdxf
@@ -238,65 +236,52 @@ def CreateGraph(dxf_file):
     
     entities = [entity for entity in modelSpace if entity.dxftype() in ('LINE', 'CIRCLE', 'ARC')]
     
-    globals().update(_dataframe_field.__members__)
-    dataframe = torch.zeros((_dataframe_field.count(), len(entities)), dtype=torch.float32, device='cuda')
+    F = _dataframe_field
+    dataframe = torch.zeros((F.count(), len(entities)), dtype=torch.float32, device='cuda')
     
     for i, entity in enumerate(entities):
-        dataframe[index,i] = i
+        dataframe[F.index,i] = i
         entity_type = entity.dxftype()
         
         if entity_type == 'LINE':
-            sx, sy, _ = entity.dxf.start
-            ex, ey, _ = entity.dxf.end
-            dx, dy = ex - sx, ey - sy
-            
-            dataframe[start_x,i] = sx
-            dataframe[start_y,i] = sy
-            dataframe[end_x,i] = ex
-            dataframe[end_y,i] = ey
-            dataframe[length,i] = torch.hypot(dx, dy)
-            dataframe[angle,i] = torch.arctan2(dy, dx) % (2*torch.pi)
+            dataframe[F.start_x,i], dataframe[F.start_y,i], _ = entity.dxf.start
+            dataframe[F.end_x,i], dataframe[F.end_y,i], _ = entity.dxf.end
             
         elif entity_type == 'CIRCLE':
-            cx, cy, _ = entity.dxf.center
-            r = entity.dxf.radius
-            
-            dataframe[circle_flag,i] = 1
-            dataframe[start_x,i] = cx
-            dataframe[start_y,i] = cy
-            dataframe[length,i] = 2 * torch.pi * r
-            dataframe[radius,i] = r
+            dataframe[F.circle_flag,i] = 1
+            dataframe[F.radius,i] = entity.dxf.radius
+            dataframe[F.start_x,i], dataframe[F.start_y,i], _ = entity.dxf.center
             
         elif entity_type == 'ARC':
-            cx, cy, _ = entity.dxf.center
-            r = entity.dxf.radius
-            sa = entity.dxf.start_angle
-            ea = entity.dxf.end_angle
-            
-            dataframe[arc_flag,i] = 1
-            dataframe[start_x,i] = cx
-            dataframe[start_y,i] = cy
-            dataframe[length,i] = r * torch.radians((ea - sa) % 360)
-            dataframe[radius,i] = r
-            dataframe[start_angle,i] = sa
-            dataframe[end_angle,i] = ea
+            dataframe[F.arc_flag,i] = 1
+            dataframe[F.radius,i] = entity.dxf.radius
+            dataframe[F.start_x,i], dataframe[F.start_y,i], _ = entity.dxf.center
+            dataframe[F.start_angle,i] = entity.dxf.start_angle
+            dataframe[F.end_angle,i] = entity.dxf.end_angle
     
-    # Define anchor point
-    anchor_x = dataframe[[start_x, end_x]].min() - 50000
-    anchor_y = dataframe[[start_y, end_y]].min() - 100000
+    # Filter lines
+    is_line = (dataframe[F.circle_flag] == 0) & (dataframe[F.arc_flag] == 0)
     
-    # Compute offset
-    sx, sy, ex, ey = dataframe[start_x], dataframe[start_y], dataframe[end_x], dataframe[end_y]
+    # Unit direction and unit perpendicular vectors
+    dx = torch.where(is_line, dataframe[F.end_x] - dataframe[F.start_x], 0)
+    dy = torch.where(is_line, dataframe[F.end_y] - dataframe[F.start_y], 0)
     
-    # Set a safe length (to avoid division by zero)
-    mask = (dataframe[circle_flag] == 0) & (dataframe[arc_flag] == 0) & (dataframe[length] > 1e-2)
-    l = dataframe[length].where(mask, 1)
+    dataframe[F.length] = torch.where(is_line, torch.clamp(torch.sqrt(dx**2 + dy**2), min=1e-4), dataframe[F.length])
     
-    # Perpendicular offset
-    dataframe[offset] = torch.abs((sx - anchor_x) * (-(ey - sy) / l) + (sy - anchor_y) * ((ex - sx) / l))
+    dataframe[F.ux] = torch.where(is_line, dx / dataframe[F.length], dataframe[F.ux])
+    dataframe[F.uy] = torch.where(is_line, dy / dataframe[F.length], dataframe[F.uy])
     
-    # Apply masking: invalid offsets get zero
-    dataframe[offset] = dataframe[offset].where(mask, 0)
+    dataframe[F.nx] = torch.where(is_line, -dataframe[F.uy], dataframe[F.nx])
+    dataframe[F.ny] = torch.where(is_line, dataframe[F.ux], dataframe[F.ny])
+    
+    # Compute circle perimeters
+    is_circle = (dataframe[F.circle_flag] == 1)
+    dataframe[F.length] = torch.where(is_circle, 2 * torch.pi * dataframe[F.radius], dataframe[F.length])
+    
+    # Compute arc lengths
+    is_arc = (dataframe[F.arc_flag] == 1)
+    arc_angle = torch.where(is_arc, ((dataframe[F.end_angle] - dataframe[F.start_angle]) % 360), 0)
+    dataframe[F.length] = torch.where(is_arc, dataframe[F.radius] * arc_angle * torch.pi/180, dataframe[F.length])
     
     graph = Graph(dataframe)
     
