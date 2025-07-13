@@ -2,7 +2,7 @@
 from enum import IntEnum
 
 class _dataframe_field(IntEnum):
-    index = 0
+    original_index = 0
     line_flag = 1
     circle_flag = 2
     arc_flag = 3
@@ -34,10 +34,8 @@ class _edge_attribute(IntEnum):
     overlap_ratio = 3
     point_intersection = 4
     segment_intersection = 5
-    angle_difference = 6
-    angle_difference_sin = 7
-    angle_difference_cos = 8
-    perimeter_intersection = 9
+    angle_difference_sin = 6
+    perimeter_intersection = 7
     
     @classmethod
     def count(cls) -> int: return len(cls)
@@ -215,16 +213,6 @@ class Graph:
         overlap_b_a = overlap_length_b / length_b
         
         return overlap_a_b, overlap_b_a # Each: shape (n_pairs,)
-        
-    
-    
-    
-    
-    
-    
-    
-    
-    
     
     def ParallelDetection(self, offset=25, angle_tolerance=0.01, min_overlap_ratio=0.2, colinear_threshold=0.5):
         F = _dataframe_field
@@ -234,7 +222,6 @@ class Graph:
         # Filter valid line indices
         is_line = (dataframe[F.line_flag] == 1) & (dataframe[F.length] > 1e-4)
         lines = dataframe[:, is_line]
-        lines[F.angle] %= torch.pi # collapse symmetrical directions
         
         # Compute OBBs
         obbs = self.create_obb(lines, width=offset, length_extension=False) # Shape (n_lines, 4, 2)
@@ -267,21 +254,27 @@ class Graph:
         perpendicular_b_a = (dx * -lines_a[F.u_y] + dy * lines_a[F.u_x]).abs() # From midpoint of line_b to line_a
         
         distance = torch.where(overlap_a_b > overlap_b_a, perpendicular_a_b, perpendicular_b_a)
+        distance = torch.hstack([distance, distance])
         
-        
-        
-        
-        
-        
-        
-        
-        i, j = i[parallel][overlap], j[parallel][overlap]
-        
-        
+        # Create edges
         Att = _edge_attribute
         
+        i, j = i[parallel][overlap], j[parallel][overlap]
+        i, j = lines[F.original_index][i], lines[F.original_index][j]
         
+        edge_pairs = torch.hstack([torch.vstack([i, j]), torch.vstack([j, i])])
         
+        edges_i_j = edges_j_i = int(edge_pairs.size(1) / 2)
+        
+        attributes = torch.zeros((edges_i_j + edges_j_i, Att.count()), dtype=torch.float32, device='cuda')
+        
+        attributes[:, Att.parallel] = 1.0
+        attributes[:, Att.colinear] = torch.where(distance < colinear_threshold, 1, 0)
+        attributes[:, Att.perpendicular_distance] = distance
+        attributes[:edges_i_j, Att.overlap_ratio] = overlap_a_b
+        attributes[edges_j_i:, Att.overlap_ratio] = overlap_b_a
+        
+        return edge_pairs, attributes
         
         
         
@@ -313,7 +306,7 @@ def CreateGraph(dxf_file):
     dataframe = torch.zeros((F.count(), len(entities)), dtype=torch.float32, device='cuda')
     
     for i, entity in enumerate(entities):
-        dataframe[F.index,i] = i
+        dataframe[F.original_index,i] = i
         entity_type = entity.dxftype()
         
         if entity_type == 'LINE':
@@ -345,7 +338,7 @@ def CreateGraph(dxf_file):
     
     is_line &= (dataframe[F.length] > 1e-4)
     
-    dataframe[F.angle] = torch.where(is_line, torch.arctan2(dy, dx) % (2*torch.pi), dataframe[F.angle])
+    dataframe[F.angle] = torch.where(is_line, torch.arctan2(dy, dx) % (torch.pi), dataframe[F.angle])
     
     # Unit direction and unit perpendicular vectors
     dataframe[F.u_x] = torch.where(is_line, dx / dataframe[F.length], dataframe[F.u_x])
