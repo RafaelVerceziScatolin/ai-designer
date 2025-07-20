@@ -85,7 +85,7 @@ class Graph:
         self._dataframe = dataframe
     
     @staticmethod
-    def create_obb(lines:Tensor, width:float, length_extension=True) -> Tensor:
+    def create_obbs(lines:Tensor, width:float, length_extension=True) -> Tensor:
         
         F = _dataframe_field
         
@@ -124,7 +124,7 @@ class Graph:
         return obbs # Shape (n_lines, 4, 2)
     
     @staticmethod
-    def check_overlap_sat(lines:Tensor, obbs:Tensor) -> Tuple[Tensor, Tensor]:
+    def get_overlaping_pairs(lines:Tensor, obbs:Tensor) -> Tuple[Tensor, Tensor]:
         
         F = _dataframe_field
         
@@ -168,12 +168,10 @@ class Graph:
         separating_axis = (max_i < min_j) | (max_j < min_i) # True if a separating axis exists
         obb_overlap = ~torch.any(separating_axis, dim=1) # True if overlap
         
-        i, j = i[obb_overlap], j[obb_overlap]
-        
-        return i, j
+        return i[obb_overlap], j[obb_overlap]
     
     @staticmethod
-    def overlap_ratios(lines_a:Tensor, lines_b:Tensor) -> Tuple[Tensor, Tensor]:
+    def get_overlap_ratios(lines_a:Tensor, lines_b:Tensor) -> Tuple[Tensor, Tensor]:
         
         F = _dataframe_field
         
@@ -214,20 +212,22 @@ class Graph:
         
         return overlap_a_b, overlap_b_a # Each: shape (n_pairs,)
     
-    def ParallelDetection(self, offset=25, angle_tolerance=0.01, min_overlap_ratio=0.2, colinear_threshold=0.5):
+    angle_tolerance=0.01
+    
+    def ParallelDetection(self, offset=25, angle_tolerance=None, min_overlap_ratio=0.2, colinear_threshold=0.5):
         F = _dataframe_field
         dataframe = self._dataframe
-        angle_tolerance *= torch.pi/180
+        angle_tolerance = (angle_tolerance or self.angle_tolerance) * torch.pi/180
         
         # Filter valid line indices
         is_line = (dataframe[F.line_flag] == 1) & (dataframe[F.length] > 1e-4)
         lines = dataframe[:, is_line]
         
         # Compute OBBs
-        obbs = self.create_obb(lines, width=offset, length_extension=False) # Shape (n_lines, 4, 2)
+        obbs = self.create_obbs(lines, width=offset, length_extension=False) # Shape (n_lines, 4, 2)
         
         # Get the pairs of overlapping obbs
-        i, j = self.check_overlap_sat(lines, obbs)
+        i, j = self.get_overlaping_pairs(lines, obbs)
         lines_a, lines_b = lines[:, i], lines[:, j]
         
         # Compute absolute angle difference in [0, pi]
@@ -235,11 +235,11 @@ class Graph:
         angle_difference = torch.minimum(angle_difference, torch.pi - angle_difference)
         
         # Keep only pairs with angle difference below threshold
-        parallel = angle_difference < angle_tolerance
+        parallel = angle_difference <= angle_tolerance
         lines_a, lines_b = lines_a[:, parallel], lines_b[:, parallel]
         
         # Compute overlap ratio
-        overlap_a_b, overlap_b_a = self.overlap_ratios(lines_a, lines_b)
+        overlap_a_b, overlap_b_a = self.get_overlap_ratios(lines_a, lines_b)
         
         # Keep only pairs that overlaps more than threshold
         overlap = (overlap_a_b > min_overlap_ratio) | (overlap_b_a > min_overlap_ratio)
@@ -254,7 +254,7 @@ class Graph:
         perpendicular_b_a = (dx * -lines_a[F.u_y] + dy * lines_a[F.u_x]).abs() # From midpoint of line_b to line_a
         
         distance = torch.where(overlap_a_b > overlap_b_a, perpendicular_a_b, perpendicular_b_a)
-        distance = torch.hstack([distance, distance])
+        distance = torch.hstack([distance, distance]) # For both edges_i_j and edges_j_i
         
         # Create edges
         Att = _edge_attribute
@@ -276,6 +276,29 @@ class Graph:
         
         return edge_pairs, attributes
         
+    def IntersectionDetection (self, obb_width=0.5, angle_tolerance=None):
+        F = _dataframe_field
+        dataframe = self._dataframe
+        angle_tolerance = (angle_tolerance or self.angle_tolerance) * torch.pi/180
+        
+        # Filter valid line indices
+        is_line = (dataframe[F.line_flag] == 1) & (dataframe[F.length] > 1e-4)
+        lines = dataframe[:, is_line]
+        
+        # Compute OBBs
+        obbs = self.create_obbs(lines, width=obb_width, length_extension=True) # Shape (n_lines, 4, 2)
+        
+        # Get the pairs of overlapping obbs
+        i, j = self.get_overlaping_pairs(lines, obbs)
+        lines_a, lines_b = lines[:, i], lines[:, j]
+        
+        # Compute absolute angle difference in [0, pi]
+        angle_difference = torch.abs(lines_a[F.angle] - lines_b[F.angle])
+        angle_difference = torch.minimum(angle_difference, torch.pi - angle_difference)
+        
+        # Keep only pairs with angle difference above threshold
+        oblique = angle_difference > angle_tolerance
+        lines_a, lines_b = lines_a[:, oblique], lines_b[:, oblique]
         
         
         
