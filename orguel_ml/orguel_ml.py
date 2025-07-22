@@ -85,14 +85,13 @@ class Graph:
         self._dataframe = dataframe
     
     @staticmethod
-    def create_obbs(lines:Tensor, width:float, length_extension=True) -> Tensor:
+    def create_obbs(lines:Tensor, width:float, length_extension:float) -> Tensor:
         
         F = _dataframe_field
         
         # Half dimensions
         half_width = width / 2
-        half_length = (lines[F.length] / 2)
-        if length_extension: half_length += half_width
+        half_length = (lines[F.length] + length_extension) / 2
         
         # Compute displacements
         dx_length = lines[F.u_x] * half_length
@@ -171,60 +170,69 @@ class Graph:
         return i[obb_overlap], j[obb_overlap]
     
     @staticmethod
-    def get_overlap_ratios(lines_a:Tensor, lines_b:Tensor) -> Tuple[Tensor, Tensor]:
+    def get_overlap_ratios(lines_a:Tensor, lines_b:Tensor) -> Tuple[Tensor, Tensor, Tensor]:
         
         F = _dataframe_field
         
         # Gather line info
         start_xa, start_ya = lines_a[F.start_x], lines_a[F.start_y]
-        end_xa, end_ya = lines_a[F.end_x], lines_a[F.end_y]
         u_xa, u_ya = lines_a[F.u_x], lines_a[F.u_y]
         length_a = lines_a[F.length]
-        
+
         start_xb, start_yb = lines_b[F.start_x], lines_b[F.start_y]
         end_xb, end_yb = lines_b[F.end_x], lines_b[F.end_y]
+        mid_xb, mid_yb = lines_b[F.mid_x], lines_b[F.mid_y]
         u_xb, u_yb = lines_b[F.u_x], lines_b[F.u_y]
         length_b = lines_b[F.length]
         
         # Project B's endpoints onto A
-        tb1 = (start_xb - start_xa) * u_xa + (start_yb - start_ya) * u_ya
-        tb2 = (end_xb - start_xa) * u_xa + (end_yb - start_ya) * u_ya
-        
+        t1 = (start_xb - start_xa) * u_xa + (start_yb - start_ya) * u_ya
+        t2 = (end_xb - start_xa) * u_xa + (end_yb - start_ya) * u_ya
+
         # Get the projected range
-        tmin, tmax = torch.minimum(tb1, tb2), torch.maximum(tb1, tb2)
+        tmin, tmax = torch.minimum(t1, t2), torch.maximum(t1, t2)
         
         # Clip the projection range within [0, length_a]
-        overlap_start_a = torch.clamp(tmin, min=0)
-        overlap_end_a = torch.clamp(tmax, max=length_a)
-        overlap_length_a = torch.clamp(overlap_end_a - overlap_start_a, min=0)
-        overlap_a_b = overlap_length_a / length_a
+        overlap_start = torch.clamp(tmin, min=0)
+        overlap_end = torch.clamp(tmax, max=length_a)
+        overlap_mid = (overlap_start + overlap_end) / 2
         
-        # Repeat for B
-        ta1 = (start_xa - start_xb) * u_xb + (start_ya - start_yb) * u_yb
-        ta2 = (end_xa - start_xb) * u_xb + (end_ya - start_yb) * u_yb
+        # Overlap ratio
+        overlap_length = torch.clamp(overlap_end - overlap_start, min=0)
+        overlap_a_b = overlap_length / length_a
+        overlap_b_a = overlap_length / length_b
         
-        smin, smax = torch.minimum(ta1, ta2), torch.maximum(ta1, ta2)
+        # Midpoint of projected overlap on line A
+        overlap_mid_xa = start_xa + u_xa * overlap_mid
+        overlap_mid_ya = start_ya + u_ya * overlap_mid
         
-        overlap_start_b = torch.clamp(smin, min=0)
-        overlap_end_b = torch.clamp(smax, max=length_b)
-        overlap_length_b = torch.clamp(overlap_end_b - overlap_start_b, min=0)
-        overlap_b_a = overlap_length_b / length_b
+        # Perpendicular distance to line B
+        dx = overlap_mid_xa - mid_xb
+        dy = overlap_mid_ya - mid_yb
         
-        return overlap_a_b, overlap_b_a # Each: shape (n_pairs,)
+        distance = (dx * -u_yb + dy * u_xb).abs() # From overlaping segment midpoint on line_a to line_b
+        
+        return overlap_a_b, overlap_b_a, distance # Each: shape (n_pairs,)
     
-    angle_tolerance=0.01
     
-    def ParallelDetection(self, offset=25, angle_tolerance=None, min_overlap_ratio=0.2, colinear_threshold=0.5):
+    
+    
+    
+    
+    line_obb_width=0.5
+    parallel_angle_tolerance=0.01
+    
+    def DetectParallel(self, offset=25, angle_tolerance=None, colinear_threshold=0.5):
         F = _dataframe_field
         dataframe = self._dataframe
-        angle_tolerance = (angle_tolerance or self.angle_tolerance) * torch.pi/180
+        angle_tolerance = (angle_tolerance or self.parallel_angle_tolerance) * torch.pi/180
         
         # Filter valid line indices
         is_line = (dataframe[F.line_flag] == 1) & (dataframe[F.length] > 1e-4)
         lines = dataframe[:, is_line]
         
         # Compute OBBs
-        obbs = self.create_obbs(lines, width=offset, length_extension=False) # Shape (n_lines, 4, 2)
+        obbs = self.create_obbs(lines, width=offset, length_extension=self.line_obb_width) # Shape (n_lines, 4, 2)
         
         # Get the pairs of overlapping obbs
         i, j = self.get_overlaping_pairs(lines, obbs)
@@ -238,28 +246,14 @@ class Graph:
         parallel = angle_difference <= angle_tolerance
         lines_a, lines_b = lines_a[:, parallel], lines_b[:, parallel]
         
-        # Compute overlap ratio
-        overlap_a_b, overlap_b_a = self.get_overlap_ratios(lines_a, lines_b)
-        
-        # Keep only pairs that overlaps more than threshold
-        overlap = (overlap_a_b > min_overlap_ratio) | (overlap_b_a > min_overlap_ratio)
-        overlap_a_b, overlap_b_a = overlap_a_b[overlap], overlap_b_a[overlap]
-        lines_a, lines_b = lines_a[:, overlap], lines_b[:, overlap]
-        
-        # Compute perpendicular distance
-        dx = lines_b[F.mid_x] - lines_a[F.mid_x]
-        dy = lines_b[F.mid_y] - lines_a[F.mid_y]
-
-        perpendicular_a_b = (dx * -lines_b[F.u_y] + dy * lines_b[F.u_x]).abs() # From midpoint of line_a to line_b
-        perpendicular_b_a = (dx * -lines_a[F.u_y] + dy * lines_a[F.u_x]).abs() # From midpoint of line_b to line_a
-        
-        distance = torch.where(overlap_a_b > overlap_b_a, perpendicular_a_b, perpendicular_b_a)
+        # Compute overlap ratio and perpendicular distance
+        overlap_a_b, overlap_b_a, distance = self.get_overlap_ratios(lines_a, lines_b)
         distance = torch.hstack([distance, distance]) # For both edges_i_j and edges_j_i
         
         # Create edges
         Att = _edge_attribute
         
-        i, j = i[parallel][overlap], j[parallel][overlap]
+        i, j = i[parallel], j[parallel]
         i, j = lines[F.original_index][i], lines[F.original_index][j]
         
         edge_pairs = torch.hstack([torch.vstack([i, j]), torch.vstack([j, i])])
@@ -275,11 +269,11 @@ class Graph:
         attributes[edges_j_i:, Att.overlap_ratio] = overlap_b_a
         
         return edge_pairs, attributes
-        
-    def IntersectionDetection (self, obb_width=0.5, angle_tolerance=None):
+     
+    def DetectIntersection (self, obb_width=0.5, angle_tolerance=None):
         F = _dataframe_field
         dataframe = self._dataframe
-        angle_tolerance = (angle_tolerance or self.angle_tolerance) * torch.pi/180
+        angle_tolerance = (angle_tolerance or self.parallel_angle_tolerance) * torch.pi/180
         
         # Filter valid line indices
         is_line = (dataframe[F.line_flag] == 1) & (dataframe[F.length] > 1e-4)
