@@ -6,23 +6,25 @@ class _dataframe_field(IntEnum):
     line_flag = 1
     circle_flag = 2
     arc_flag = 3
-    start_x = 4
-    start_y = 5
-    end_x = 6
-    end_y = 7
-    mid_x = 8
-    mid_y = 9
-    length = perimeter = 10
-    angle = 11
-    u_x = 12
-    u_y = 13
-    n_x = 14
-    n_y = 15
-    center_x = 16
-    center_y = 17
-    radius = 18
-    start_angle = 19
-    end_angle = 20
+    point_flag = 4
+    start_x = 5
+    start_y = 6
+    end_x = 7
+    end_y = 8
+    mid_x = 9
+    mid_y = 10
+    length = perimeter = 11
+    angle = 12
+    u_x = 13
+    u_y = 14
+    n_x = 15
+    n_y = 16
+    center_x = 17
+    center_y = 18
+    radius = 19
+    start_angle = 20
+    end_angle = 21
+    arc_span = 22
     
     @classmethod
     def count(cls) -> int: return len(cls)
@@ -85,45 +87,107 @@ class Graph:
         self._dataframe = dataframe
     
     @staticmethod
-    def create_obbs(lines:Tensor, width:float, length_extension:float) -> Tensor:
+    def create_obbs(elements:Tensor, width:float, length_extension:float=0.0) -> Tuple[Tensor, Tensor]:
         
         F = _dataframe_field
+        n_elements = elements.size(1)
         
-        # Half dimensions
-        half_width = width / 2
-        half_length = (lines[F.length] + length_extension) / 2
+        # Filter supported elements
+        is_line = elements[F.line_flag] == 1
+        is_circle = elements[F.circle_flag] == 1
+        is_arc = elements[F.arc_flag] == 1
         
-        # Compute displacements
-        dx_length = lines[F.u_x] * half_length
-        dy_length = lines[F.u_y] * half_length
-        dx_width = lines[F.n_x] * half_width
-        dy_width = lines[F.n_y] * half_width
+        filter = is_line | is_circle | is_arc
         
-        # Corners (4 per OBB)
-        corner1_x = lines[F.mid_x] - dx_length - dx_width
-        corner1_y = lines[F.mid_y] - dy_length - dy_width
-
-        corner2_x = lines[F.mid_x] + dx_length - dx_width
-        corner2_y = lines[F.mid_y] + dy_length - dy_width
-
-        corner3_x = lines[F.mid_x] + dx_length + dx_width
-        corner3_y = lines[F.mid_y] + dy_length + dy_width
-
-        corner4_x = lines[F.mid_x] - dx_length + dx_width
-        corner4_y = lines[F.mid_y] - dy_length + dy_width
+        obbs = torch.empty((n_elements, 4, 2), dtype=torch.float32, device='cuda')
         
-        # Stack corners
-        obbs = torch.stack([
-            torch.stack([corner1_x, corner1_y], dim=1),
-            torch.stack([corner2_x, corner2_y], dim=1),
-            torch.stack([corner3_x, corner3_y], dim=1),
-            torch.stack([corner4_x, corner4_y], dim=1)
-        ], dim=1)
-
-        return obbs # Shape (n_lines, 4, 2)
+        if is_line.any():
+            # === LINE ELEMENTS ===
+            lines = elements[:, is_line]
+            
+            # Half dimensions
+            half_width = width / 2
+            half_length = (lines[F.length] + length_extension) / 2
+            
+            # Compute displacements
+            dx_length = lines[F.u_x] * half_length
+            dy_length = lines[F.u_y] * half_length
+            dx_width = lines[F.n_x] * half_width
+            dy_width = lines[F.n_y] * half_width
+            
+            # Corners (4 per OBB)
+            corner1 = torch.stack([lines[F.mid_x] - dx_length - dx_width,
+                                   lines[F.mid_y] - dy_length - dy_width], dim=1)
+            
+            corner2 = torch.stack([lines[F.mid_x] + dx_length - dx_width,
+                                   lines[F.mid_y] + dy_length - dy_width], dim=1)
+            
+            corner3 = torch.stack([lines[F.mid_x] + dx_length + dx_width,
+                                   lines[F.mid_y] + dy_length + dy_width], dim=1)
+            
+            corner4 = torch.stack([lines[F.mid_x] - dx_length + dx_width,
+                                   lines[F.mid_y] - dy_length + dy_width], dim=1)
+            
+            # Stack corners
+            obbs[is_line] = torch.stack([corner1, corner2, corner3, corner4], dim=1)
+        
+        if is_circle.any():
+            # === CIRCLE ELEMENTS ===
+            circles = elements[:, is_circle]
+            
+            radius = circles[F.radius] + width
+            
+            min_x = circles[F.center_x] - radius
+            min_y = circles[F.center_y] - radius
+            max_x = circles[F.center_x] + radius
+            max_y = circles[F.center_y] + radius
+            
+            corner1 = torch.stack([min_x, min_y], dim=1)
+            corner2 = torch.stack([max_x, min_y], dim=1)
+            corner3 = torch.stack([max_x, max_y], dim=1)
+            corner4 = torch.stack([min_x, max_y], dim=1)
+            
+            obbs[is_circle] = torch.stack([corner1, corner2, corner3, corner4], dim=1)
+        
+        if is_arc.any():
+            # === ARC ELEMENTS ===
+            arcs = elements[:, is_arc]
+            
+            margin = width / 2
+            
+            u_x, u_y, n_x, n_y = arcs[F.u_x], arcs[F.u_y], arcs[F.n_x], arcs[F.n_y]
+            arc_span, radius = arcs[F.arc_span], arcs[F.radius]
+            
+            dx_length = torch.where(arc_span < torch.pi, n_x * (radius * torch.sin(arc_span/2) + margin), n_x * (radius + margin))
+            dy_length = torch.where(arc_span < torch.pi, n_y * (radius * torch.sin(arc_span/2) + margin), n_y * (radius + margin))
+            
+            dx_width = u_x * (radius * (1 - torch.cos(arc_span/2)) + margin)
+            dy_width = u_y * (radius * (1 - torch.cos(arc_span/2)) + margin)
+            
+            dx_margin = u_x * margin
+            dy_margin = u_y * margin
+            
+            corner1 = torch.stack([arcs[F.mid_x] - dx_length + dx_margin,
+                                   arcs[F.mid_y] - dy_length + dy_margin], dim=1)
+            
+            corner2 = torch.stack([arcs[F.mid_x] + dx_length + dx_margin,
+                                   arcs[F.mid_y] + dy_length + dy_margin], dim=1)
+            
+            corner3 = torch.stack([arcs[F.mid_x] + dx_length - dx_width,
+                                   arcs[F.mid_y] + dy_length - dy_width], dim=1)
+            
+            corner4 = torch.stack([arcs[F.mid_x] - dx_length - dx_width,
+                                   arcs[F.mid_y] - dy_length - dy_width], dim=1)
+            
+            obbs[is_arc] = torch.stack([corner1, corner2, corner3, corner4], dim=1)
+        
+        elements = elements[:, filter]
+        obbs = obbs[filter]
+        
+        return elements, obbs # Shape obbs (n_elements, 4, 2)
     
     @staticmethod
-    def get_overlaping_pairs(lines:Tensor, obbs:Tensor) -> Tuple[Tensor, Tensor]:
+    def get_overlaping_pairs(elements:Tensor, obbs:Tensor) -> Tuple[Tensor, Tensor]:
         
         F = _dataframe_field
         
@@ -150,8 +214,8 @@ class Graph:
         obbs_i, obbs_j = obbs[i], obbs[j]
         
         # axes per box
-        axes_i = torch.stack([lines[F.u_x, i], lines[F.u_y, i], lines[F.n_x, i], lines[F.n_y, i]], dim=1).reshape(-1,2,2)
-        axes_j = torch.stack([lines[F.u_x, j], lines[F.u_y, j], lines[F.n_x, j], lines[F.n_y, j]], dim=1).reshape(-1,2,2)
+        axes_i = torch.stack([elements[F.u_x, i], elements[F.u_y, i], elements[F.n_x, i], elements[F.n_y, i]], dim=1).reshape(-1,2,2)
+        axes_j = torch.stack([elements[F.u_x, j], elements[F.u_y, j], elements[F.n_x, j], elements[F.n_y, j]], dim=1).reshape(-1,2,2)
         axes = torch.cat([axes_i, axes_j], axis=1) # shape (n_pairs, 4, 2)
         
         # Project corners onto axes
@@ -215,40 +279,76 @@ class Graph:
         return overlap_a_b, overlap_b_a, distance # Each: shape (n_pairs,)
     
     @staticmethod
-    def get_intersections(lines_a:Tensor, lines_b:Tensor) -> Tuple[Tensor, Tensor]:
+    def get_intersection_positions(elements_a:Tensor, elements_b:Tensor):
         
         F = _dataframe_field
+        n_elements = elements_a.size(1)
         
-        # Gather line info
-        start_xa, start_ya = lines_a[F.start_x], lines_a[F.start_y]
-        u_xa, u_ya = lines_a[F.u_x], lines_a[F.u_y]
-        length_a = lines_a[F.length]
+        # Filter supported pairs
+        is_line_a, is_line_b = elements_a[F.line_flag] == 1, elements_b[F.line_flag] == 1
+        is_circle_a, is_circle_b = elements_a[F.circle_flag] == 1, elements_b[F.circle_flag] == 1
+        is_arc_a, is_arc_b = elements_a[F.arc_flag] == 1, elements_b[F.arc_flag] == 1
         
-        start_xb, start_yb = lines_b[F.start_x], lines_b[F.start_y]
-        u_xb, u_yb = lines_b[F.u_x], lines_b[F.u_y]
-        length_b = lines_b[F.length]
+        line_line_pair = is_line_a & is_line_b
+        line_circle_pair, circle_line_pair = is_line_a & is_circle_b, is_circle_a & is_line_b
         
-        # Vector from B start to A start
-        w_x = start_xa - start_xb
-        w_y = start_ya - start_yb
+        filter = line_line_pair | (line_circle_pair | circle_line_pair)
         
-        # Core dot products
-        b = u_xa * u_xb + u_ya * u_yb
-        d = u_xa * w_x + u_ya * w_y
-        e = u_xb * w_x + u_yb * w_y
+        min_intersection_a = torch.empty(n_elements, dtype=torch.float32, device='cuda')
+        max_intersection_a = torch.empty(n_elements, dtype=torch.float32, device='cuda')
+        min_intersection_b = torch.empty(n_elements, dtype=torch.float32, device='cuda')
+        max_intersection_b = torch.empty(n_elements, dtype=torch.float32, device='cuda')
         
-        denominator = 1 - b * b
+        if line_line_pair.any():
+            lines_a = elements_a[:, line_line_pair]
+            lines_b = elements_b[:, line_line_pair]
+            
+            # Gather line info
+            start_xa, start_ya = lines_a[F.start_x], lines_a[F.start_y]
+            u_xa, u_ya = lines_a[F.u_x], lines_a[F.u_y]
+            length_a = lines_a[F.length]
+
+            start_xb, start_yb = lines_b[F.start_x], lines_b[F.start_y]
+            u_xb, u_yb = lines_b[F.u_x], lines_b[F.u_y]
+            length_b = lines_b[F.length]
+
+            # Vector from B start to A start
+            w_x = start_xa - start_xb
+            w_y = start_ya - start_yb
+
+            # Core dot products
+            b = u_xa * u_xb + u_ya * u_yb
+            d = u_xa * w_x + u_ya * w_y
+            e = u_xb * w_x + u_yb * w_y
+
+            denominator = 1 - b * b
+
+            # Get closest point parameters along each line
+            t = (b * e - d) / denominator  # Along A
+            s = (e - b * d) / denominator  # Along B
+
+            # Convert to relative position from center [-1, 1]
+            min_intersection_a[line_line_pair] = max_intersection_a[line_line_pair] = ((t / length_a).clamp(0, 1)) * 2 - 1
+            min_intersection_b[line_line_pair] = max_intersection_b[line_line_pair] = ((s / length_b).clamp(0, 1)) * 2 - 1
         
-        # Get closest point parameters along each line
-        t = (b * e - d) / denominator  # Along A
-        s = (e - b * d) / denominator  # Along B
+        if (line_circle_pair | circle_line_pair).any():
         
-        # Convert to relative position from center [-1, 1]
-        intersection_a = ((t / length_a).clamp(0, 1)) * 2 - 1  # shape: (n_pairs,)
-        intersection_b = ((s / length_b).clamp(0, 1)) * 2 - 1
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
         
         return intersection_a, intersection_b
-    
     
     
     
@@ -261,11 +361,11 @@ class Graph:
         angle_tolerance = (angle_tolerance or self.parallel_angle_tolerance) * torch.pi/180
         
         # Filter valid line indices
-        is_line = (dataframe[F.line_flag] == 1) & (dataframe[F.length] > 1e-4)
+        is_line = dataframe[F.line_flag] == 1
         lines = dataframe[:, is_line]
         
         # Compute OBBs
-        obbs = self.create_obbs(lines, width=offset, length_extension=self.line_obb_width) # Shape (n_lines, 4, 2)
+        lines, obbs = self.create_obbs(elements=lines, width=offset, length_extension=self.line_obb_width) # Shape obbs (n_lines, 4, 2)
         
         # Get the pairs of overlapping obbs
         i, j = self.get_overlaping_pairs(lines, obbs)
@@ -306,19 +406,36 @@ class Graph:
     def DetectIntersection(self, obb_width=None, angle_tolerance=None):
         F = _dataframe_field
         dataframe = self._dataframe
-        obb_width = (obb_width or self.line_obb_width)
+        obb_width = obb_width or self.line_obb_width
         angle_tolerance = (angle_tolerance or self.parallel_angle_tolerance) * torch.pi/180
         
-        # Filter valid line indices
-        is_line = (dataframe[F.line_flag] == 1) & (dataframe[F.length] > 1e-4)
-        lines = dataframe[:, is_line]
-        
         # Compute OBBs
-        obbs = self.create_obbs(lines, width=obb_width, length_extension=obb_width) # Shape (n_lines, 4, 2)
+        elements, obbs = self.create_obbs(elements=dataframe, width=obb_width, length_extension=obb_width) # Shape obbs (n_lines, 4, 2)
         
         # Get the pairs of overlapping obbs
-        i, j = self.get_overlaping_pairs(lines, obbs)
-        lines_a, lines_b = lines[:, i], lines[:, j]
+        i, j = self.get_overlaping_pairs(elements, obbs)
+        elements_a, elements_b = elements[:, i], elements[:, j]
+        
+        # Compute absolute angle difference for line-line pairs in [0, pi]
+        line_line_pair = (elements_a[F.line_flag] == 1) & (elements_b[F.line_flag] == 1)
+        angle_difference = torch.where(line_line_pair, torch.abs(elements_a[F.angle] - elements_b[F.angle]), 0)
+        angle_difference = torch.where(line_line_pair, torch.minimum(angle_difference, torch.pi - angle_difference), angle_difference)
+        
+        # Keep only pairs with angle difference above threshold
+        oblique = torch.where(line_line_pair, angle_difference > angle_tolerance, True)
+        elements_a, elements_b = elements_a[:, oblique], elements_b[:, oblique]
+        
+        # Compute intersection positions
+        intersection_a, intersection_b = self.get_intersection_positions(elements_a, elements_b)
+        
+        
+        
+        
+        
+        
+        
+        
+        
         
         # Compute absolute angle difference in [0, pi]
         angle_difference = torch.abs(lines_a[F.angle] - lines_b[F.angle])
@@ -329,7 +446,7 @@ class Graph:
         lines_a, lines_b = lines_a[:, oblique], lines_b[:, oblique]
         
         # Compute intersection positions
-        intersection_a, intersection_b = self.get_intersections(lines_a, lines_b)
+        intersection_a, intersection_b = self.get_intersection_positions(lines_a, lines_b)
         
         # Create edges
         Att = _edge_attribute
@@ -384,8 +501,8 @@ def CreateGraph(dxf_file):
             dataframe[F.start_angle,i] = entity.dxf.start_angle
             dataframe[F.end_angle,i] = entity.dxf.end_angle
     
-    # Filter lines
-    is_line = (dataframe[F.line_flag] == 1)
+    # === LINES ===
+    is_line = dataframe[F.line_flag] == 1
     
     dataframe[F.mid_x] = torch.where(is_line, (dataframe[F.start_x] + dataframe[F.end_x]) / 2, dataframe[F.mid_x])
     dataframe[F.mid_y] = torch.where(is_line, (dataframe[F.start_y] + dataframe[F.end_y]) / 2, dataframe[F.mid_y])
@@ -394,26 +511,54 @@ def CreateGraph(dxf_file):
     dy = torch.where(is_line, dataframe[F.end_y] - dataframe[F.start_y], 0)
     dataframe[F.length] = torch.where(is_line, torch.sqrt(dx**2 + dy**2), dataframe[F.length])
     
-    is_line &= (dataframe[F.length] > 1e-4)
+    is_point = is_line & (dataframe[F.length] <= 1e-3)
     
-    dataframe[F.angle] = torch.where(is_line, torch.arctan2(dy, dx) % (torch.pi), dataframe[F.angle])
+    is_line &= ~is_point
+    
+    dataframe[F.angle] = torch.where(is_line, torch.arctan2(dy, dx) % torch.pi, dataframe[F.angle])
     
     # Unit direction and unit perpendicular vectors
     dataframe[F.u_x] = torch.where(is_line, dx / dataframe[F.length], dataframe[F.u_x])
     dataframe[F.u_y] = torch.where(is_line, dy / dataframe[F.length], dataframe[F.u_y])
-    
     dataframe[F.n_x] = torch.where(is_line, -dataframe[F.u_y], dataframe[F.n_x])
     dataframe[F.n_y] = torch.where(is_line, dataframe[F.u_x], dataframe[F.n_y])
     
-    # Compute circle perimeters
-    is_circle = (dataframe[F.circle_flag] == 1)
+    # === POINTS ===
+    dataframe[F.point_flag] = torch.where(is_point, 1, dataframe[F.point_flag])
+    dataframe[F.line_flag] = torch.where(is_point, 0, dataframe[F.line_flag])
+    
+    # === CIRCLES ===
+    is_circle = dataframe[F.circle_flag] == 1
+    
+    dataframe[F.u_x] = torch.where(is_circle, 1, dataframe[F.u_x])
+    dataframe[F.u_y] = torch.where(is_circle, 0, dataframe[F.u_y])
+    dataframe[F.n_x] = torch.where(is_circle, 0, dataframe[F.n_x])
+    dataframe[F.n_y] = torch.where(is_circle, 1, dataframe[F.n_y])
+    
     dataframe[F.perimeter] = torch.where(is_circle, 2 * torch.pi * dataframe[F.radius], dataframe[F.perimeter])
     
-    # Compute arc lengths
-    is_arc = (dataframe[F.arc_flag] == 1)
-    arc_angle = torch.where(is_arc, ((dataframe[F.end_angle] - dataframe[F.start_angle]) % 360), 0)
-    dataframe[F.perimeter] = torch.where(is_arc, dataframe[F.radius] * arc_angle * torch.pi/180, dataframe[F.perimeter])
+    # === ARCS ===
+    is_arc = dataframe[F.arc_flag] == 1
+    
+    dataframe[F.start_angle] = torch.where(is_arc, torch.deg2rad(dataframe[F.start_angle]), dataframe[F.start_angle])
+    dataframe[F.end_angle] = torch.where(is_arc, torch.deg2rad(dataframe[F.end_angle]), dataframe[F.end_angle])
+    
+    dataframe[F.arc_span] = torch.where(is_arc, ((dataframe[F.end_angle] - dataframe[F.start_angle]) % (2*torch.pi)), 0)
+    mid_angle = torch.where(is_arc, (dataframe[F.start_angle] + dataframe[F.arc_span] / 2) % (2*torch.pi), 0)
+    
+    dataframe[F.start_x] = torch.where(is_arc, dataframe[F.center_x] + dataframe[F.radius] * torch.cos(dataframe[F.start_angle]), dataframe[F.start_x])
+    dataframe[F.start_y] = torch.where(is_arc, dataframe[F.center_y] + dataframe[F.radius] * torch.sin(dataframe[F.start_angle]), dataframe[F.start_y])
+    dataframe[F.end_x] = torch.where(is_arc, dataframe[F.center_x] + dataframe[F.radius] * torch.cos(dataframe[F.end_angle]), dataframe[F.end_x])
+    dataframe[F.end_y] = torch.where(is_arc, dataframe[F.center_y] + dataframe[F.radius] * torch.sin(dataframe[F.end_angle]), dataframe[F.end_y])
+    dataframe[F.mid_x] = torch.where(is_arc, dataframe[F.center_x] + dataframe[F.radius] * torch.cos(mid_angle), dataframe[F.mid_x])
+    dataframe[F.mid_y] = torch.where(is_arc, dataframe[F.center_y] + dataframe[F.radius] * torch.sin(mid_angle), dataframe[F.mid_y])
+    
+    dataframe[F.u_x] = torch.where(is_arc, (dataframe[F.mid_x] - dataframe[F.center_x]) / dataframe[F.radius], dataframe[F.u_x])
+    dataframe[F.u_y] = torch.where(is_arc, (dataframe[F.mid_y] - dataframe[F.center_y]) / dataframe[F.radius], dataframe[F.u_y])
+    dataframe[F.n_x] = torch.where(is_arc, -dataframe[F.u_y], dataframe[F.n_x])
+    dataframe[F.n_y] = torch.where(is_arc, dataframe[F.u_x], dataframe[F.n_y])
+    
+    dataframe[F.perimeter] = torch.where(is_arc, dataframe[F.radius] * dataframe[F.arc_span], dataframe[F.perimeter])
     
     graph = Graph(dataframe)
-    
     
