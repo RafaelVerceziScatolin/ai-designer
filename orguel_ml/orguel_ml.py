@@ -278,6 +278,34 @@ class Graph:
         
         return overlap_a_b, overlap_b_a, distance # Each: shape (n_pairs,)
     
+    def _get_line_circle_intersections(lines:Tensor, circles:Tensor, margin:float):
+        
+        F = _dataframe_field
+        
+        dx_start = lines[F.start_x] - circles[F.center_x]
+        dy_start = lines[F.start_y] - circles[F.center_y]
+        dx_end = lines[F.end_x] - circles[F.center_x]
+        dy_end = lines[F.end_y] - circles[F.center_y]
+        dx_mid = lines[F.mid_x] - circles[F.center_x]
+        dy_mid = lines[F.mid_y] - circles[F.center_y]
+        
+        distance_start = torch.sqrt(dx_start**2 + dy_start**2)
+        distance_end = torch.sqrt(dx_end**2 + dy_end**2)
+        distance_mid = torch.sqrt(dx_mid**2 + dy_mid**2)
+        
+        inner_radius = circles[F.radius] - margin
+        outer_radius = circles[F.radius] + margin
+        
+        # Filter pairs in which the lines does't touch the circle perimeter
+        remove= ~(((distance_start < inner_radius) & (distance_end < inner_radius)) | (
+                (distance_start > outer_radius) & (distance_end > outer_radius) & (distance_mid > outer_radius)))
+        
+        circles, lines = circles[:, remove], lines[:, remove]
+    
+    
+    
+    
+    
     @staticmethod
     def get_intersection_positions(elements_a:Tensor, elements_b:Tensor):
         
