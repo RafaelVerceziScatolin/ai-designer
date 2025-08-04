@@ -4,28 +4,29 @@ from enum import IntEnum
 class _dataframe_field(IntEnum):
     original_index = 0
     line_flag = 1
-    arc_flag = 2
-    point_flag = 3
-    start_x = 4
-    start_y = 5
-    end_x = 6
-    end_y = 7
-    mid_x = 8
-    mid_y = 9
-    length = perimeter = 10
+    circle_flag = 2
+    arc_flag = 3
+    point_flag = 4
+    start_x = 5
+    start_y = 6
+    end_x = 7
+    end_y = 8
+    mid_x = 9
+    mid_y = 10
     angle = 11
-    d_x = 12
-    d_y = 13
-    u_x = 14
-    u_y = 15
-    n_x = 16
-    n_y = 17
-    center_x = 18
-    center_y = 19
-    radius = 20
-    start_angle = 21
-    end_angle = 22
-    arc_span = 23
+    length = perimeter = 12
+    d_x = 13
+    d_y = 14
+    u_x = 15
+    u_y = 16
+    n_x = 17
+    n_y = 18
+    center_x = 19
+    center_y = 20
+    radius = 21
+    start_angle = 22
+    end_angle = 23
+    arc_span = 24
     
     @classmethod
     def count(cls) -> int: return len(cls)
@@ -95,9 +96,9 @@ class Graph:
         
         # Filter supported elements
         is_line = elements[F.line_flag] == 1
-        is_arc = elements[F.arc_flag] == 1
+        is_circle_or_arc = (elements[F.circle_flag] == 1) | (elements[F.arc_flag] == 1)
         
-        filter = is_line | is_arc
+        filter = is_line | is_circle_or_arc
         
         obbs = torch.empty((n_elements, 4, 2), dtype=torch.float32, device='cuda')
         
@@ -131,9 +132,9 @@ class Graph:
             # Stack corners
             obbs[is_line] = torch.stack([corner1, corner2, corner3, corner4], dim=1)
         
-        if is_arc.any():
+        if is_circle_or_arc.any():
             # === ARC ELEMENTS ===
-            arcs = elements[:, is_arc]
+            arcs = elements[:, is_circle_or_arc]
             
             margin = width / 2
             
@@ -161,7 +162,7 @@ class Graph:
             corner4 = torch.stack([arcs[F.mid_x] - dx_length - dx_width,
                                    arcs[F.mid_y] - dy_length - dy_width], dim=1)
             
-            obbs[is_arc] = torch.stack([corner1, corner2, corner3, corner4], dim=1)
+            obbs[is_circle_or_arc] = torch.stack([corner1, corner2, corner3, corner4], dim=1)
         
         elements = elements[:, filter]
         obbs = obbs[filter]
@@ -484,7 +485,7 @@ def CreateGraph(dxf_file):
     doc = ezdxf.readfile(dxf_file)
     modelSpace = doc.modelspace()
     
-    entities = [entity for entity in modelSpace if entity.dxftype() in ('LINE', 'CIRCLE', 'ARC')]
+    entities = [entity for entity in modelSpace if entity.dxftype() in ('LINE', 'POINT', 'CIRCLE', 'ARC')]
     
     F = _dataframe_field
     dataframe = torch.zeros((F.count(), len(entities)), dtype=torch.float32, device='cuda')
@@ -498,8 +499,13 @@ def CreateGraph(dxf_file):
             dataframe[F.start_x,i], dataframe[F.start_y,i], _ = entity.dxf.start
             dataframe[F.end_x,i], dataframe[F.end_y,i], _ = entity.dxf.end
         
+        elif entity_type == 'POINT':
+            dataframe[F.point_flag,i] = 1
+            dataframe[F.mid_x,i], dataframe[F.mid_y,i], _ = entity.dxf.location
+            
         elif entity_type in ('CIRCLE', 'ARC'):
-            dataframe[F.arc_flag,i] = 1
+            dataframe[F.circle_flag,i] = 1 if entity_type == 'CIRCLE' else 0
+            dataframe[F.arc_flag,i] = 1 if entity_type == 'ARC' else 0
             dataframe[F.radius,i] = entity.dxf.radius
             dataframe[F.center_x,i], dataframe[F.center_y,i], _ = entity.dxf.center
             dataframe[F.start_angle,i] = 0 if entity_type == 'CIRCLE' else entity.dxf.start_angle
@@ -508,18 +514,17 @@ def CreateGraph(dxf_file):
     # === LINES ===
     is_line = dataframe[F.line_flag] == 1
     
+    min_length = 1e-3
+    
     dataframe[F.mid_x] = torch.where(is_line, (dataframe[F.start_x] + dataframe[F.end_x]) / 2, dataframe[F.mid_x])
     dataframe[F.mid_y] = torch.where(is_line, (dataframe[F.start_y] + dataframe[F.end_y]) / 2, dataframe[F.mid_y])
     
     dataframe[F.d_x] = torch.where(is_line, dataframe[F.end_x] - dataframe[F.start_x], dataframe[F.d_x])
     dataframe[F.d_y] = torch.where(is_line, dataframe[F.end_y] - dataframe[F.start_y], dataframe[F.d_y])
+    dataframe[F.angle] = torch.where(is_line, torch.arctan2(dataframe[F.d_y], dataframe[F.d_x]) % torch.pi, dataframe[F.angle])
     dataframe[F.length] = torch.where(is_line, torch.sqrt(dataframe[F.d_x]**2 + dataframe[F.d_y]**2), dataframe[F.length])
     
-    is_point = is_line & (dataframe[F.length] <= 1e-3)
-    
-    is_line &= ~is_point
-    
-    dataframe[F.angle] = torch.where(is_line, torch.arctan2(dataframe[F.d_y], dataframe[F.d_x]) % torch.pi, dataframe[F.angle])
+    is_line &= (dataframe[F.length] > min_length)
     
     # Unit direction and unit perpendicular vectors
     dataframe[F.u_x] = torch.where(is_line, dataframe[F.d_x] / dataframe[F.length], dataframe[F.u_x])
@@ -528,31 +533,43 @@ def CreateGraph(dxf_file):
     dataframe[F.n_y] = torch.where(is_line, dataframe[F.u_x], dataframe[F.n_y])
     
     # === POINTS ===
-    dataframe[F.point_flag] = torch.where(is_point, 1, dataframe[F.point_flag])
-    dataframe[F.line_flag] = torch.where(is_point, 0, dataframe[F.line_flag])
+    is_point = dataframe[F.point_flag] == 1
+    
+    for field in [F.start_x, F.end_x]: dataframe[field] = torch.where(is_point, dataframe[F.mid_x], dataframe[field])
+    for field in [F.start_y, F.end_y]: dataframe[field] = torch.where(is_point, dataframe[F.mid_y], dataframe[field])
+    
+    is_line_point = (dataframe[F.line_flag] == 1) & (dataframe[F.length] <= min_length)
+    
+    dataframe[F.point_flag] = torch.where(is_line_point, 1, dataframe[F.point_flag])
+    dataframe[F.line_flag] = torch.where(is_line_point, 0, dataframe[F.line_flag])
     
     # === CIRCLES AND ARCS ===
+    is_circle = dataframe[F.circle_flag] == 1
     is_arc = dataframe[F.arc_flag] == 1
+    is_circle_or_arc = is_circle | is_arc
     
-    dataframe[F.start_angle] = torch.where(is_arc, torch.deg2rad(dataframe[F.start_angle]), dataframe[F.start_angle])
-    dataframe[F.end_angle] = torch.where(is_arc, torch.deg2rad(dataframe[F.end_angle]), dataframe[F.end_angle])
+    dataframe[F.start_angle] = torch.where(is_circle_or_arc, torch.deg2rad(dataframe[F.start_angle]), dataframe[F.start_angle])
+    dataframe[F.end_angle] = torch.where(is_circle_or_arc, torch.deg2rad(dataframe[F.end_angle]), dataframe[F.end_angle])
     
-    dataframe[F.arc_span] = torch.where(is_arc, ((dataframe[F.end_angle] - dataframe[F.start_angle]) % (2*torch.pi)), 0)
-    mid_angle = torch.where(is_arc, (dataframe[F.start_angle] + dataframe[F.arc_span] / 2) % (2*torch.pi), 0)
+    dataframe[F.arc_span] = torch.where(is_circle, 2 * torch.pi, dataframe[F.arc_span])
+    dataframe[F.arc_span] = torch.where(is_arc, ((dataframe[F.end_angle] - dataframe[F.start_angle]) % (2*torch.pi)), dataframe[F.arc_span])
     
-    dataframe[F.start_x] = torch.where(is_arc, dataframe[F.center_x] + dataframe[F.radius] * torch.cos(dataframe[F.start_angle]), dataframe[F.start_x])
-    dataframe[F.start_y] = torch.where(is_arc, dataframe[F.center_y] + dataframe[F.radius] * torch.sin(dataframe[F.start_angle]), dataframe[F.start_y])
-    dataframe[F.end_x] = torch.where(is_arc, dataframe[F.center_x] + dataframe[F.radius] * torch.cos(dataframe[F.end_angle]), dataframe[F.end_x])
-    dataframe[F.end_y] = torch.where(is_arc, dataframe[F.center_y] + dataframe[F.radius] * torch.sin(dataframe[F.end_angle]), dataframe[F.end_y])
-    dataframe[F.mid_x] = torch.where(is_arc, dataframe[F.center_x] + dataframe[F.radius] * torch.cos(mid_angle), dataframe[F.mid_x])
-    dataframe[F.mid_y] = torch.where(is_arc, dataframe[F.center_y] + dataframe[F.radius] * torch.sin(mid_angle), dataframe[F.mid_y])
+    mid_angle = torch.where(is_circle_or_arc, (dataframe[F.start_angle] + dataframe[F.arc_span] / 2) % (2*torch.pi), 0)
     
-    dataframe[F.u_x] = torch.where(is_arc, (dataframe[F.mid_x] - dataframe[F.center_x]) / dataframe[F.radius], dataframe[F.u_x])
-    dataframe[F.u_y] = torch.where(is_arc, (dataframe[F.mid_y] - dataframe[F.center_y]) / dataframe[F.radius], dataframe[F.u_y])
-    dataframe[F.n_x] = torch.where(is_arc, -dataframe[F.u_y], dataframe[F.n_x])
-    dataframe[F.n_y] = torch.where(is_arc, dataframe[F.u_x], dataframe[F.n_y])
+    dataframe[F.start_x] = torch.where(is_circle_or_arc, dataframe[F.center_x] + dataframe[F.radius] * torch.cos(dataframe[F.start_angle]), dataframe[F.start_x])
+    dataframe[F.start_y] = torch.where(is_circle_or_arc, dataframe[F.center_y] + dataframe[F.radius] * torch.sin(dataframe[F.start_angle]), dataframe[F.start_y])
+    dataframe[F.end_x] = torch.where(is_circle_or_arc, dataframe[F.center_x] + dataframe[F.radius] * torch.cos(dataframe[F.end_angle]), dataframe[F.end_x])
+    dataframe[F.end_y] = torch.where(is_circle_or_arc, dataframe[F.center_y] + dataframe[F.radius] * torch.sin(dataframe[F.end_angle]), dataframe[F.end_y])
+    dataframe[F.mid_x] = torch.where(is_circle_or_arc, dataframe[F.center_x] + dataframe[F.radius] * torch.cos(mid_angle), dataframe[F.mid_x])
+    dataframe[F.mid_y] = torch.where(is_circle_or_arc, dataframe[F.center_y] + dataframe[F.radius] * torch.sin(mid_angle), dataframe[F.mid_y])
     
-    dataframe[F.perimeter] = torch.where(is_arc, dataframe[F.radius] * dataframe[F.arc_span], dataframe[F.perimeter])
+    dataframe[F.u_x] = torch.where(is_circle_or_arc, (dataframe[F.mid_x] - dataframe[F.center_x]) / dataframe[F.radius], dataframe[F.u_x])
+    dataframe[F.u_y] = torch.where(is_circle_or_arc, (dataframe[F.mid_y] - dataframe[F.center_y]) / dataframe[F.radius], dataframe[F.u_y])
+    dataframe[F.n_x] = torch.where(is_circle_or_arc, -dataframe[F.u_y], dataframe[F.n_x])
+    dataframe[F.n_y] = torch.where(is_circle_or_arc, dataframe[F.u_x], dataframe[F.n_y])
+    
+    dataframe[F.perimeter] = torch.where(is_circle_or_arc, dataframe[F.radius] * dataframe[F.arc_span], dataframe[F.perimeter])
     
     graph = Graph(dataframe)
+    
     
