@@ -261,53 +261,143 @@ class Graph:
         
         return overlap_a_b, overlap_b_a, distance # Each: shape (n_pairs,)
     
-    def _get_line_circle_intersections(lines:Tensor, circles:Tensor, margin:float):
+    def _get_line_arc_intersections(lines:Tensor, arcs:Tensor, margin:float) -> Tuple[Tensor, Tensor, Tensor, 
+                                                                                      Tensor, Tensor, Tensor, Tensor]:
         
         F = _dataframe_field
         
-        dx_start = lines[F.start_x] - circles[F.center_x]
-        dy_start = lines[F.start_y] - circles[F.center_y]
-        dx_end = lines[F.end_x] - circles[F.center_x]
-        dy_end = lines[F.end_y] - circles[F.center_y]
-        dx_mid = lines[F.mid_x] - circles[F.center_x]
-        dy_mid = lines[F.mid_y] - circles[F.center_y]
+        dx_start = arcs[F.center_x] - lines[F.start_x]
+        dy_start = arcs[F.center_y] - lines[F.start_y]
+        dx_end = arcs[F.center_x] - lines[F.end_x]
+        dy_end = arcs[F.center_y] - lines[F.end_y]
         
         distance_start = torch.sqrt(dx_start**2 + dy_start**2)
         distance_end = torch.sqrt(dx_end**2 + dy_end**2)
-        distance_mid = torch.sqrt(dx_mid**2 + dy_mid**2)
         
-        inner_radius = circles[F.radius] - margin
-        outer_radius = circles[F.radius] + margin
+        # Remove pairs in which the lines falls completelly within the circle inner perimeter
+        inner_radius = arcs[F.radius] - margin
         
-        # Filter pairs in which the lines does't touch the circle perimeter
-        remove= ~(((distance_start < inner_radius) & (distance_end < inner_radius)) | (
-                (distance_start > outer_radius) & (distance_end > outer_radius) & (distance_mid > outer_radius)))
+        start_in_inner = distance_start < inner_radius
+        end_in_inner = distance_end < inner_radius
         
-        circles, lines = circles[:, remove], lines[:, remove]
-    
-    
-    
-    
+        mask1 = ~(start_in_inner & end_in_inner)
+        
+        arcs, lines = arcs[:, mask1], lines[:, mask1]
+        dx_start, dy_start = dx_start[mask1], dy_start[mask1]
+        inner_radius = inner_radius[mask1]
+        start_in_inner, end_in_inner = start_in_inner[mask1], end_in_inner[mask1]
+        
+        # Compute closest distance betweem the center of the circle and the line
+        t = torch.clamp((dx_start * lines[F.d_x] + dy_start * lines[F.d_y]) / lines[F.length]**2, min=0, max=1)
+        closest_x, closest_y = lines[F.start_x] + t * lines[F.d_x], lines[F.start_y] + t * lines[F.d_y]
+        
+        closest_distance = torch.sqrt((closest_x - arcs[F.center_x])**2 + (closest_y - arcs[F.center_y])**2)
+        
+        # Remove pairs in which the lines falls completelly out of the circle outer perimeter
+        outer_radius = arcs[F.radius] + margin
+        
+        mask2 = ~(closest_distance > outer_radius)
+        
+        arcs, lines = arcs[:, mask2], lines[:, mask2]
+        dx_start, dy_start = dx_start[mask2], dy_start[mask2]
+        inner_radius = inner_radius[mask2]
+        start_in_inner, end_in_inner = start_in_inner[mask2], end_in_inner[mask2]
+        closest_distance = closest_distance[mask2]
+
+        # Compute min and max intersections
+        a = lines[F.u_x]**2 + lines[F.u_y]**2
+        b = 2 * (dx_start * lines[F.u_x] + dy_start * lines[F.u_y])
+        c = dx_start**2 + dy_start**2 - arcs[F.radius]**2
+        discriminant = torch.clamp(b**2 - 4 * a * c, min=0)
+        
+        sqrt_discriminant = torch.sqrt(discriminant)
+        
+        t1 = (-b - sqrt_discriminant) / (2 * a)
+        t2 = (-b + sqrt_discriminant) / (2 * a)
+        t1, t2 = -t1, -t2
+        
+        t_min = torch.minimum(t1, t2)
+        t_max = torch.maximum(t1, t2)
+        
+        t_min = torch.where(start_in_inner, t_max, t_min)
+        t_max = torch.where(end_in_inner, t_min, t_max)
+        
+        closest_out_inner = closest_distance >= inner_radius
+        
+        t_min = torch.where(closest_out_inner & (t_min < 0), t_max, t_min)
+        t_max = torch.where(closest_out_inner & (t_max > lines[F.length]), t_min, t_max)
+        
+        # Check whether the intersections fall on arc range
+        ix = lines[F.start_x] + t_min * lines[F.u_x]
+        iy = lines[F.start_y] + t_min * lines[F.u_y]
+        jx = lines[F.start_x] + t_max * lines[F.u_x]
+        jy = lines[F.start_y] + t_max * lines[F.u_y]
+        
+        angle1 = torch.atan2(iy - arcs[F.center_y], ix - arcs[F.center_x]) % (2 * torch.pi)
+        angle2 = torch.atan2(jy - arcs[F.center_y], jx - arcs[F.center_x]) % (2 * torch.pi)
+        
+        start_angle, end_angle = arcs[F.start_angle], arcs[F.end_angle]
+        
+        on_arc_range1 = torch.where(start_angle < end_angle, (start_angle <= angle1) & (angle1 <= end_angle), (start_angle <= angle1) | (angle1 <= end_angle))
+        on_arc_range2 = torch.where(start_angle < end_angle, (start_angle <= angle2) & (angle2 <= end_angle), (start_angle <= angle2) | (angle2 <= end_angle))
+        
+        on_arc_range1 |= closest_out_inner
+        on_arc_range2 |= closest_out_inner
+        
+        # Keep only pairs where there are at least one intersection on the arc range
+        mask3 = (on_arc_range1 | on_arc_range2)
+
+        arcs, lines = arcs[:, mask3], lines[:, mask3]
+        t_min, t_max = t_min[mask3], t_max[mask3]
+        angle1, angle2 = angle1[mask3], angle2[mask3]
+        start_angle, end_angle = start_angle[mask3], end_angle[mask3]
+        on_arc_range1, on_arc_range2 = on_arc_range1[mask3], on_arc_range2[mask3]
+        
+        t_min = torch.where(on_arc_range1, t_min, t_max)
+        t_max = torch.where(on_arc_range2, t_max, t_min)
+        angle1 = torch.where(on_arc_range1, angle1, angle2)
+        angle2 = torch.where(on_arc_range2, angle2, angle1)
+        
+        on_arc_range = torch.where(start_angle < end_angle, (start_angle <= angle1) & (angle1 <= end_angle), (start_angle <= angle1) | (angle1 <= end_angle))
+        
+        angle1_position = torch.where(on_arc_range, (angle1 - start_angle), (angle1 - start_angle).clamp(min=0).clamp(max=arcs[F.arc_span]))
+        angle2_position = torch.where(on_arc_range, (angle2 - start_angle), (angle2 - start_angle).clamp(min=0).clamp(max=arcs[F.arc_span]))
+        angle1_position = ((angle1_position % (2*torch.pi)) / (arcs[F.arc_span] / 2)) -1
+        angle2_position = ((angle2_position % (2*torch.pi)) / (arcs[F.arc_span] / 2)) -1
+        
+        intersection_min = torch.clamp(t_min / lines[F.length], min=0, max=1)
+        intersection_max = torch.clamp(t_max / lines[F.length], min=0, max=1)
+        angle_min = torch.minimum(angle1_position, angle2_position)
+        angle_max = torch.maximum(angle1_position, angle2_position)
+        
+        mask = torch.zeros_like(mask1, dtype=torch.bool, device='cuda')
+        mask[mask1] = mask2
+        mask[mask.clone()] = mask3
+        
+        return lines, arcs, intersection_min, intersection_max, angle_min, angle_max, mask
     
     @staticmethod
-    def get_intersection_positions(elements_a:Tensor, elements_b:Tensor):
+    def get_intersection_positions(elements_a:Tensor, elements_b:Tensor, margin:float) -> Tuple[Tensor, Tensor, Tensor, 
+                                                                                                Tensor, Tensor, Tensor]:
         
         F = _dataframe_field
-        n_elements = elements_a.size(1)
+        n_pairs = elements_a.size(1)
         
         # Filter supported pairs
-        is_line_a, is_line_b = elements_a[F.line_flag] == 1, elements_b[F.line_flag] == 1
-        is_arc_a, is_arc_b = elements_a[F.arc_flag] == 1, elements_b[F.arc_flag] == 1
+        is_line_a = elements_a[F.line_flag] == 1
+        is_line_b = elements_b[F.line_flag] == 1
+        is_arc_a = (elements_a[F.circle_flag] == 1) | (elements_a[F.arc_flag] == 1)
+        is_arc_b = (elements_b[F.circle_flag] == 1) | (elements_b[F.arc_flag] == 1)
         
         line_line_pair = is_line_a & is_line_b
         line_arc_pair, arc_line_pair = is_line_a & is_arc_b, is_arc_a & is_line_b
         
         filter = line_line_pair | (line_arc_pair | arc_line_pair)
         
-        intersection_a_min = torch.empty(n_elements, dtype=torch.float32, device='cuda')
-        intersection_a_max = torch.empty(n_elements, dtype=torch.float32, device='cuda')
-        intersection_b_min = torch.empty(n_elements, dtype=torch.float32, device='cuda')
-        intersection_b_max = torch.empty(n_elements, dtype=torch.float32, device='cuda')
+        intersection_a_min = torch.empty(n_pairs, dtype=torch.float32, device='cuda')
+        intersection_a_max = torch.empty(n_pairs, dtype=torch.float32, device='cuda')
+        intersection_b_min = torch.empty(n_pairs, dtype=torch.float32, device='cuda')
+        intersection_b_max = torch.empty(n_pairs, dtype=torch.float32, device='cuda')
         
         if line_line_pair.any():
             lines_a = elements_a[:, line_line_pair]
@@ -342,23 +432,36 @@ class Graph:
             intersection_b_min[line_line_pair] = intersection_b_max[line_line_pair] = ((s / length_b).clamp(0, 1)) * 2 - 1
         
         if (line_arc_pair | arc_line_pair).any():
+            
+            if line_arc_pair.any():
+                lines_a, arcs_b = elements_a[:, line_arc_pair], elements_b[:, line_arc_pair]
+                
+                lines_a, arcs_b, intersection_min, intersection_max, \
+                angle_min, angle_max, filter[line_arc_pair] = Graph._get_line_arc_intersections(lines_a, arcs_b, margin)
+                
+                # Save the min and max
+                intersection_a_min[line_arc_pair & filter] = intersection_min
+                intersection_a_max[line_arc_pair & filter] = intersection_max
+                intersection_b_min[line_arc_pair & filter] = angle_min
+                intersection_b_max[line_arc_pair & filter] = angle_max
+            
+            if arc_line_pair.any():
+                arcs_a, lines_b = elements_a[:, arc_line_pair], elements_b[:, arc_line_pair]
+                
+                lines_b, arcs_a, intersection_min, intersection_max, \
+                angle_min, angle_max, filter[arc_line_pair] = Graph._get_line_arc_intersections(lines_b, arcs_a, margin)
+                
+                # Save the min and max
+                intersection_a_min[arc_line_pair & filter] = angle_min
+                intersection_a_max[arc_line_pair & filter] = angle_max
+                intersection_b_min[arc_line_pair & filter] = intersection_min
+                intersection_b_max[arc_line_pair & filter] = intersection_max
         
+        elements_a, elements_b = elements_a[:, filter], elements_b[:, filter]
+        intersection_a_min, intersection_a_max = intersection_a_min[filter], intersection_a_max[filter]
+        intersection_b_min, intersection_b_max = intersection_b_min[filter], intersection_b_max[filter]
         
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        return intersection_a, intersection_b
+        return elements_a, elements_b, intersection_a_min, intersection_a_max, intersection_b_min, intersection_b_max
     
     
     
@@ -436,7 +539,12 @@ class Graph:
         elements_a, elements_b = elements_a[:, oblique], elements_b[:, oblique]
         
         # Compute intersection positions
-        intersection_a, intersection_b = self.get_intersection_positions(elements_a, elements_b)
+        elements_a, elements_b, intersection_a_min, \
+        intersection_a_max, intersection_b_min, intersection_b_max = self.get_intersection_positions(elements_a, elements_b, margin=obb_width)
+        
+        
+        
+        
         
         
         
