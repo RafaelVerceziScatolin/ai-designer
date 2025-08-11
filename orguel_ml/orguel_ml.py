@@ -39,9 +39,10 @@ class _edge_attribute(IntEnum):
     oblique = 4
     intersection_min = 5
     intersection_max = 6
-    angle_difference_sin = 7
+    angle_difference_sin_min = 7
     angle_difference_cos_min = 8
-    angle_difference_cos_max = 9
+    angle_difference_sin_max = 9
+    angle_difference_cos_max = 10
     
     @classmethod
     def count(cls) -> int: return len(cls)
@@ -57,7 +58,7 @@ class Graph:
         Att = _edge_attribute
         
         self._dataframe = dataframe
-        self.edge_pairs = torch.empty([2, 0], dtype=torch.float32, device='cuda')
+        self.edge_pairs = torch.empty([2, 0], dtype=torch.long, device='cuda')
         self.attributes = torch.empty([0, Att.count()], dtype=torch.float32, device='cuda')
         
         functions = [
@@ -246,7 +247,7 @@ class Graph:
         return overlap_a_b, overlap_b_a, distance # Each: shape (n_pairs,)
     
     def _get_line_arc_intersections(lines:Tensor, arcs:Tensor, margin:float) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, 
-                                                                                      Tensor, Tensor, Tensor, Tensor, Tensor]:
+                                                                                      Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
         
         F = _dataframe_field
         
@@ -361,11 +362,12 @@ class Graph:
         sin2 = lines[F.u_x] * rx2 + lines[F.u_y] * ry2
         cos2 = -(lines[F.u_x] * ry2 - lines[F.u_y] * rx2)
         
-        angle_difference_sin = sin1.abs()
-        angle_difference_cos_min = torch.where(sin1 == 0, 1, torch.where(sin1 < 0, -cos1, cos1))
-        angle_difference_cos_max = torch.where(sin2 == 0, 1, torch.where(sin2 < 0, -cos2, cos2))
+        angle_difference_sin_min = torch.clamp(sin1, min=-1, max=1)
+        angle_difference_sin_max = torch.clamp(sin2, min=-1, max=1)
+        angle_difference_cos_min = torch.clamp(cos1, min=-1, max=1)
+        angle_difference_cos_max = torch.clamp(cos2, min=-1, max=1)
         
-        # Compute intersections on the line and arc
+        # Compute intersections on arcs and lines
         on_arc_range = torch.where(start_angle < end_angle, (start_angle <= angle1) & (angle1 <= end_angle), (start_angle <= angle1) | (angle1 <= end_angle))
         
         arc_intersection_min = torch.where(on_arc_range, (angle1 - start_angle), (angle1 - start_angle).clamp(min=0).clamp(max=arcs[F.arc_span]))
@@ -380,12 +382,12 @@ class Graph:
         mask[mask1] = mask2
         mask[mask.clone()] = mask3
         
-        return lines, arcs, line_intersection_min, line_intersection_max, arc_intersection_min, \
-               arc_intersection_max, angle_difference_sin, angle_difference_cos_min, angle_difference_cos_max, mask
+        return lines, arcs, line_intersection_min, line_intersection_max, arc_intersection_min, arc_intersection_max, \
+               angle_difference_sin_min, angle_difference_cos_min, angle_difference_sin_max, angle_difference_cos_max, mask
     
     @staticmethod
-    def get_intersection_positions(elements_a:Tensor, elements_b:Tensor, margin:float) -> Tuple[Tensor, Tensor, Tensor, Tensor,
-                                                                                                Tensor, Tensor, Tensor, Tensor, Tensor]:
+    def get_intersection_positions(elements_a:Tensor, elements_b:Tensor, margin:float, angle_tolerance:float) -> \
+        Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
         
         F = _dataframe_field
         n_pairs = elements_a.size(1)
@@ -406,14 +408,29 @@ class Graph:
         intersection_b_min = torch.empty(n_pairs, dtype=torch.float32, device='cuda')
         intersection_b_max = torch.empty(n_pairs, dtype=torch.float32, device='cuda')
         
-        angle_difference_sin = torch.empty(n_pairs, dtype=torch.float32, device='cuda')
+        angle_difference_b_a_sin_min = torch.empty(n_pairs, dtype=torch.float32, device='cuda')
         angle_difference_b_a_cos_min = torch.empty(n_pairs, dtype=torch.float32, device='cuda')
+        angle_difference_b_a_sin_max = torch.empty(n_pairs, dtype=torch.float32, device='cuda')
         angle_difference_b_a_cos_max = torch.empty(n_pairs, dtype=torch.float32, device='cuda')
         
         if line_line_pair.any():
             lines_a = elements_a[:, line_line_pair]
             lines_b = elements_b[:, line_line_pair]
-
+            
+            # Compute absolute angle difference in [0, pi]
+            angle_difference_b_a = (lines_b[F.angle] - lines_a[F.angle]) % (2*torch.pi)
+            min_angle_difference = angle_difference_b_a % torch.pi
+            min_angle_difference = torch.minimum(min_angle_difference, torch.pi - min_angle_difference)
+            
+            # Keep only pairs with angle difference above threshold
+            oblique = min_angle_difference > angle_tolerance
+            lines_a, lines_b = lines_a[:, oblique], lines_b[:, oblique]
+            angle_difference_b_a = angle_difference_b_a[oblique]
+            filter[line_line_pair] = oblique
+            
+            # Update line_line_pair
+            line_line_pair &= filter
+            
             # Vector from B start to A start
             w_x = lines_a[F.start_x] - lines_b[F.start_x]
             w_y = lines_a[F.start_y] - lines_b[F.start_y]
@@ -434,55 +451,50 @@ class Graph:
             intersection_b_min[line_line_pair] = intersection_b_max[line_line_pair] = ((s / lines_b[F.length]).clamp(0, 1)) * 2 - 1
             
             # get angle difference sin and cos
-            angle_difference_b_a = (lines_b[F.angle] - lines_a[F.angle]) % torch.pi
-            
-            angle_difference_sin[line_line_pair] = torch.sin(angle_difference_b_a)
-            angle_difference_b_a_cos_min[line_line_pair] = torch.cos(angle_difference_b_a)
-            angle_difference_b_a_cos_max[line_line_pair] = angle_difference_b_a_cos_min[line_line_pair]
+            angle_difference_b_a_sin_min[line_line_pair] = angle_difference_b_a_sin_max[line_line_pair] = torch.sin(angle_difference_b_a)
+            angle_difference_b_a_cos_min[line_line_pair] = angle_difference_b_a_cos_max[line_line_pair] = torch.cos(angle_difference_b_a)
             
         if (line_arc_pair | arc_line_pair).any():
-            
             if line_arc_pair.any():
                 lines_a, arcs_b = elements_a[:, line_arc_pair], elements_b[:, line_arc_pair]
                 
-                lines_a, arcs_b, line_intersection_min, line_intersection_max, arc_intersection_min, arc_intersection_max, angle_b_a_sin, \
-                angle_b_a_cos_min, angle_b_a_cos_max, filter[line_arc_pair] = Graph._get_line_arc_intersections(lines_a, arcs_b, margin)
+                lines_a, arcs_b, line_intersection_min, line_intersection_max, arc_intersection_min, arc_intersection_max, \
+                angle_b_a_sin_min, angle_b_a_cos_min, angle_b_a_sin_max, angle_b_a_cos_max, filter[line_arc_pair] = Graph._get_line_arc_intersections(lines_a, arcs_b, margin)
+                
+                # Update line_arc_pair
+                line_arc_pair &= filter
                 
                 # Save the min and max
-                intersection_a_min[line_arc_pair & filter] = line_intersection_min
-                intersection_a_max[line_arc_pair & filter] = line_intersection_max
-                intersection_b_min[line_arc_pair & filter] = arc_intersection_min
-                intersection_b_max[line_arc_pair & filter] = arc_intersection_max
+                intersection_a_min[line_arc_pair], intersection_a_max[line_arc_pair] = line_intersection_min, line_intersection_max
+                intersection_b_min[line_arc_pair], intersection_b_max[line_arc_pair] = arc_intersection_min, arc_intersection_max
                 
-                angle_difference_sin[line_arc_pair & filter] = angle_b_a_sin
-                angle_difference_b_a_cos_min[line_arc_pair & filter] = angle_b_a_cos_min
-                angle_difference_b_a_cos_max[line_arc_pair & filter] = angle_b_a_cos_max
+                angle_difference_b_a_sin_min[line_arc_pair], angle_difference_b_a_cos_min[line_arc_pair] = angle_b_a_sin_min, angle_b_a_cos_min
+                angle_difference_b_a_sin_max[line_arc_pair], angle_difference_b_a_cos_max[line_arc_pair] = angle_b_a_sin_max, angle_b_a_cos_max
             
             if arc_line_pair.any():
                 arcs_a, lines_b = elements_a[:, arc_line_pair], elements_b[:, arc_line_pair]
                 
-                lines_b, arcs_a, line_intersection_min, line_intersection_max, arc_intersection_min, arc_intersection_max, angle_b_a_sin, \
-                angle_b_a_cos_min, angle_b_a_cos_max, filter[arc_line_pair] = Graph._get_line_arc_intersections(lines_b, arcs_a, margin)
+                lines_b, arcs_a, line_intersection_min, line_intersection_max, arc_intersection_min, arc_intersection_max, \
+                angle_b_a_sin_min, angle_b_a_cos_min, angle_b_a_sin_max, angle_b_a_cos_max, filter[arc_line_pair] = Graph._get_line_arc_intersections(lines_b, arcs_a, margin)
+                
+                # Update arc_line_pair
+                arc_line_pair &= filter
                 
                 # Save the min and max
-                intersection_a_min[arc_line_pair & filter] = arc_intersection_min
-                intersection_a_max[arc_line_pair & filter] = arc_intersection_max
-                intersection_b_min[arc_line_pair & filter] = line_intersection_min
-                intersection_b_max[arc_line_pair & filter] = line_intersection_max
+                intersection_a_min[arc_line_pair], intersection_a_max[arc_line_pair] = arc_intersection_min, arc_intersection_max
+                intersection_b_min[arc_line_pair], intersection_b_max[arc_line_pair] = line_intersection_min, line_intersection_max
                 
-                angle_difference_sin[arc_line_pair & filter] = angle_b_a_sin
-                angle_difference_b_a_cos_min[arc_line_pair & filter] = angle_b_a_cos_min
-                angle_difference_b_a_cos_max[arc_line_pair & filter] = angle_b_a_cos_max
-        
+                angle_difference_b_a_sin_min[arc_line_pair], angle_difference_b_a_cos_min[arc_line_pair] = angle_b_a_sin_min, angle_b_a_cos_min
+                angle_difference_b_a_sin_max[arc_line_pair], angle_difference_b_a_cos_max[arc_line_pair] = angle_b_a_sin_max, angle_b_a_cos_max
+                
         elements_a, elements_b = elements_a[:, filter], elements_b[:, filter]
         intersection_a_min, intersection_a_max = intersection_a_min[filter], intersection_a_max[filter]
         intersection_b_min, intersection_b_max = intersection_b_min[filter], intersection_b_max[filter]
-        angle_difference_sin = angle_difference_sin[filter]
-        angle_difference_b_a_cos_min = angle_difference_b_a_cos_min[filter]
-        angle_difference_b_a_cos_max = angle_difference_b_a_cos_max[filter]
+        angle_difference_b_a_sin_min, angle_difference_b_a_cos_min = angle_difference_b_a_sin_min[filter], angle_difference_b_a_cos_min[filter]
+        angle_difference_b_a_sin_max, angle_difference_b_a_cos_max = angle_difference_b_a_sin_max[filter], angle_difference_b_a_cos_max[filter]
         
         return elements_a, elements_b, intersection_a_min, intersection_a_max, intersection_b_min, intersection_b_max, \
-               angle_difference_sin, angle_difference_b_a_cos_min, angle_difference_b_a_cos_max
+               angle_difference_b_a_sin_min, angle_difference_b_a_cos_min, angle_difference_b_a_sin_max, angle_difference_b_a_cos_max
     
     line_obb_width=0.5
     parallel_angle_tolerance=0.01
@@ -504,12 +516,18 @@ class Graph:
         lines_a, lines_b = lines[:, i], lines[:, j]
         
         # Compute absolute angle difference in [0, pi]
-        angle_difference = (lines_a[F.angle] - lines_b[F.angle]) % torch.pi
-        angle_difference = torch.minimum(angle_difference, torch.pi - angle_difference)
+        angle_difference_b_a = (lines_b[F.angle] - lines_a[F.angle]) % (2*torch.pi)
+        min_angle_difference = angle_difference_b_a % torch.pi
+        min_angle_difference = torch.minimum(min_angle_difference, torch.pi - min_angle_difference)
         
         # Keep only pairs with angle difference below threshold
-        parallel = angle_difference <= angle_tolerance
+        parallel = min_angle_difference <= angle_tolerance
         lines_a, lines_b = lines_a[:, parallel], lines_b[:, parallel]
+        angle_difference_b_a = angle_difference_b_a[parallel]
+        
+        # get the angle difference sin and cos
+        angle_difference_b_a_sin_min = angle_difference_b_a_sin_max = torch.sin(angle_difference_b_a)
+        angle_difference_b_a_cos_min = angle_difference_b_a_cos_max = torch.cos(angle_difference_b_a)
         
         # Compute overlap ratio and perpendicular distance
         overlap_a_b, overlap_b_a, distance = self.get_overlap_ratios(lines_a, lines_b)
@@ -518,7 +536,7 @@ class Graph:
         # Create edges
         Att = _edge_attribute
         
-        i, j = lines_a[F.original_index], lines_b[F.original_index]
+        i, j = lines_a[F.original_index].long(), lines_b[F.original_index].long()
         
         edge_pairs = torch.hstack([torch.vstack([i, j]), torch.vstack([j, i])])
         
@@ -529,8 +547,18 @@ class Graph:
         attributes[:, Att.parallel] = 1.0
         attributes[:, Att.colinear] = torch.where(distance < colinear_threshold, 1, 0)
         attributes[:, Att.perpendicular_distance] = distance
+        
         attributes[:edges_i_j, Att.overlap_ratio] = overlap_a_b
+        attributes[:edges_i_j, Att.angle_difference_sin_min] = -angle_difference_b_a_sin_min
+        attributes[:edges_i_j, Att.angle_difference_cos_min] = angle_difference_b_a_cos_min
+        attributes[:edges_i_j, Att.angle_difference_sin_max] = -angle_difference_b_a_sin_max
+        attributes[:edges_i_j, Att.angle_difference_cos_max] = angle_difference_b_a_cos_max
+        
         attributes[edges_j_i:, Att.overlap_ratio] = overlap_b_a
+        attributes[edges_j_i:, Att.angle_difference_sin_min] = angle_difference_b_a_sin_min
+        attributes[edges_j_i:, Att.angle_difference_cos_min] = angle_difference_b_a_cos_min
+        attributes[edges_j_i:, Att.angle_difference_sin_max] = angle_difference_b_a_sin_max
+        attributes[edges_j_i:, Att.angle_difference_cos_max] = angle_difference_b_a_cos_max
         
         return edge_pairs, attributes
      
@@ -547,23 +575,10 @@ class Graph:
         i, j = self.find_overlaping_pairs(elements, obbs)
         elements_a, elements_b = elements[:, i], elements[:, j]
         
-        # Compute absolute angle difference for line-line pairs in [0, pi]
-        line_line_pair = (elements_a[F.line_flag] == 1) & (elements_b[F.line_flag] == 1)
-        angle_difference = torch.where(line_line_pair, (elements_a[F.angle] - elements_b[F.angle]) % torch.pi, 0)
-        angle_difference = torch.where(line_line_pair, torch.minimum(angle_difference, torch.pi - angle_difference), angle_difference)
-        
-        # Keep only pairs with angle difference above threshold
-        oblique = torch.where(line_line_pair, angle_difference > angle_tolerance, True)
-        elements_a, elements_b = elements_a[:, oblique], elements_b[:, oblique]
-        
         # Compute intersection positions
-        
-        
-        
-        
-        
-        elements_a, elements_b, intersection_a_min, \
-        intersection_a_max, intersection_b_min, intersection_b_max = self.get_intersection_positions(elements_a, elements_b, margin=obb_width)
+        elements_a, elements_b, intersection_a_min, intersection_a_max, intersection_b_min, intersection_b_max, \
+        angle_difference_b_a_sin_min, angle_difference_b_a_cos_min,angle_difference_b_a_sin_max, angle_difference_b_a_cos_max \
+        = self.get_intersection_positions(elements_a, elements_b, margin=obb_width, angle_tolerance=angle_tolerance)
         
         # Create edges
         Att = _edge_attribute
@@ -577,10 +592,20 @@ class Graph:
         attributes = torch.zeros((edges_i_j + edges_j_i, Att.count()), dtype=torch.float32, device='cuda')
         
         attributes[:, Att.oblique] = 1.0
+
         attributes[:edges_i_j, Att.intersection_min] = intersection_a_min
         attributes[:edges_i_j, Att.intersection_max] = intersection_a_max
+        attributes[:edges_i_j, Att.angle_difference_sin_min] = -angle_difference_b_a_sin_min
+        attributes[:edges_i_j, Att.angle_difference_cos_min] = angle_difference_b_a_cos_min
+        attributes[:edges_i_j, Att.angle_difference_sin_max] = -angle_difference_b_a_sin_max
+        attributes[:edges_i_j, Att.angle_difference_cos_max] = angle_difference_b_a_cos_max
+
         attributes[edges_j_i:, Att.intersection_min] = intersection_b_min
         attributes[edges_j_i:, Att.intersection_max] = intersection_b_max
+        attributes[edges_j_i:, Att.angle_difference_sin_min] = angle_difference_b_a_sin_min
+        attributes[edges_j_i:, Att.angle_difference_cos_min] = angle_difference_b_a_cos_min
+        attributes[edges_j_i:, Att.angle_difference_sin_max] = angle_difference_b_a_sin_max
+        attributes[edges_j_i:, Att.angle_difference_cos_max] = angle_difference_b_a_cos_max
         
         return edge_pairs, attributes
         
@@ -627,7 +652,7 @@ def CreateGraph(dxf_file):
     
     dataframe[F.d_x] = torch.where(is_line, dataframe[F.end_x] - dataframe[F.start_x], dataframe[F.d_x])
     dataframe[F.d_y] = torch.where(is_line, dataframe[F.end_y] - dataframe[F.start_y], dataframe[F.d_y])
-    dataframe[F.angle] = torch.where(is_line, torch.arctan2(dataframe[F.d_y], dataframe[F.d_x]) % torch.pi, dataframe[F.angle])
+    dataframe[F.angle] = torch.where(is_line, torch.arctan2(dataframe[F.d_y], dataframe[F.d_x]) % (2*torch.pi), dataframe[F.angle])
     dataframe[F.length] = torch.where(is_line, torch.sqrt(dataframe[F.d_x]**2 + dataframe[F.d_y]**2), dataframe[F.length])
     
     is_line &= (dataframe[F.length] > min_length)
