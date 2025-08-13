@@ -17,10 +17,10 @@ class _dataframe_field(IntEnum):
     length = perimeter = 12
     d_x = 13
     d_y = 14
-    u_x = 15
-    u_y = 16
-    n_x = 17
-    n_y = 18
+    u_x = t_x = 15
+    u_y = t_y = 16
+    n_x = r_x = 17
+    n_y = r_y = 18
     center_x = 19
     center_y = 20
     radius = 21
@@ -55,11 +55,12 @@ torch.set_default_device('cuda')
 class Graph:
     def __init__(self, dataframe:Tensor):
         
+        F = _dataframe_field
         Att = _edge_attribute
         
         self._dataframe = dataframe
         self.edge_pairs = torch.empty([2, 0], dtype=torch.long)
-        self.attributes = torch.empty([0, Att.count()], dtype=torch.float32)
+        self.edge_attributes = torch.empty([0, Att.count()], dtype=torch.float32)
         
         functions = [
             self.DetectParallel,
@@ -67,10 +68,44 @@ class Graph:
         ]
         
         for function in functions:
-            edge_pairs, attributes = function()
-            self.edge_pairs = torch.hstack([self.edge_pairs, edge_pairs])
-            self.attributes = torch.vstack([self.attributes, attributes])
-          
+            pairs, attributes = function()
+            self.edge_pairs = torch.hstack([self.edge_pairs, pairs])
+            self.edge_attributes = torch.vstack([self.edge_attributes, attributes])
+        
+        # Update flags and reshape for ML model
+        is_point = dataframe[F.point_flag] == 1
+        is_circle = dataframe[F.circle_flag] == 1
+        
+        dataframe[F.line_flag] = torch.where(is_point, 1, dataframe[F.line_flag])
+        dataframe[F.arc_flag] = torch.where(is_circle, 1, dataframe[F.arc_flag])
+        
+        line_flag = dataframe[F.line_flag].reshape([-1, 1]) # shape (N, 1)
+        arc_flag = dataframe[F.arc_flag].reshape([-1, 1]) # shape (N, 1)
+        
+        # Normalize coordinates
+        coordinates_x = torch.hstack([dataframe[F.start_x], dataframe[F.end_x]])
+        coordinates_y = torch.hstack([dataframe[F.start_y], dataframe[F.end_y]])
+        coordinates_x_mean, coordinates_x_std = coordinates_x.mean(), coordinates_x.std()
+        coordinates_y_mean, coordinates_y_std = coordinates_y.mean(), coordinates_y.std()
+        
+        normalized_start_x = (dataframe[F.start_x] - coordinates_x_mean) / coordinates_x_std
+        normalized_start_y = (dataframe[F.start_y] - coordinates_y_mean) / coordinates_y_std
+        normalized_end_x = (dataframe[F.end_x] - coordinates_x_mean) / coordinates_x_std
+        normalized_end_y = (dataframe[F.end_y] - coordinates_y_mean) / coordinates_y_std
+        
+        normalized_coordinates = torch.stack([normalized_start_x, normalized_start_y, 
+                                              normalized_end_x, normalized_end_y], dim=1) # shape (N, 4)
+        
+        # Normalize length and offset
+        normalized_length = (dataframe[F.length] / self.p95_length).clamp(min=0, max=1).reshape([-1, 1]) # shape (N, 1)
+        self.edge_attributes[:, Att.offset] = (self.edge_attributes[:, Att.offset] / self.parallel_max_offset).clamp(min=-1, max=1)
+        
+        # Stack direction unit vectors
+        direction = torch.stack([dataframe[F.u_x], dataframe[F.u_y]], dim=1) # shape (N, 2)
+        
+        # Node attributes
+        self.node_attributes = torch.hstack([line_flag, arc_flag, normalized_coordinates, normalized_length, direction])
+        
     @staticmethod
     def create_obbs(elements:Tensor, width:float, length_extension:float=0.0) -> Tuple[Tensor, Tensor]:
         
@@ -121,17 +156,17 @@ class Graph:
             
             margin = width / 2
             
-            u_x, u_y, n_x, n_y = arcs[F.u_x], arcs[F.u_y], arcs[F.n_x], arcs[F.n_y]
+            r_x, r_y, t_x, t_y = arcs[F.r_x], arcs[F.r_y], arcs[F.t_x], arcs[F.t_y]
             arc_span, radius = arcs[F.arc_span], arcs[F.radius]
-            
-            dx_length = torch.where(arc_span < torch.pi, n_x * (radius * torch.sin(arc_span/2) + margin), n_x * (radius + margin))
-            dy_length = torch.where(arc_span < torch.pi, n_y * (radius * torch.sin(arc_span/2) + margin), n_y * (radius + margin))
-            
-            dx_width = u_x * (radius * (1 - torch.cos(arc_span/2)) + margin)
-            dy_width = u_y * (radius * (1 - torch.cos(arc_span/2)) + margin)
-            
-            dx_margin = u_x * margin
-            dy_margin = u_y * margin
+
+            dx_length = torch.where(arc_span < torch.pi, t_x * (radius * torch.sin(arc_span/2) + margin), t_x * (radius + margin))
+            dy_length = torch.where(arc_span < torch.pi, t_y * (radius * torch.sin(arc_span/2) + margin), t_y * (radius + margin))
+
+            dx_width = r_x * (radius * (1 - torch.cos(arc_span/2)) + margin)
+            dy_width = r_y * (radius * (1 - torch.cos(arc_span/2)) + margin)
+
+            dx_margin = r_x * margin
+            dy_margin = r_y * margin
             
             corner1 = torch.stack([arcs[F.mid_x] - dx_length + dx_margin,
                                    arcs[F.mid_y] - dy_length + dy_margin], dim=1)
@@ -200,49 +235,43 @@ class Graph:
         return i[obb_overlap], j[obb_overlap]
     
     @staticmethod
-    def get_overlap_ratios(lines_a:Tensor, lines_b:Tensor) -> Tuple[Tensor, Tensor, Tensor]:
+    def get_overlap_ratios(lines_a:Tensor, lines_b:Tensor) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
         
         F = _dataframe_field
         
-        # Gather line info
-        start_xa, start_ya = lines_a[F.start_x], lines_a[F.start_y]
-        u_xa, u_ya = lines_a[F.u_x], lines_a[F.u_y]
-        length_a = lines_a[F.length]
-
-        start_xb, start_yb = lines_b[F.start_x], lines_b[F.start_y]
-        end_xb, end_yb = lines_b[F.end_x], lines_b[F.end_y]
-        mid_xb, mid_yb = lines_b[F.mid_x], lines_b[F.mid_y]
-        u_xb, u_yb = lines_b[F.u_x], lines_b[F.u_y]
-        length_b = lines_b[F.length]
-        
         # Project B's endpoints onto A
-        t1 = (start_xb - start_xa) * u_xa + (start_yb - start_ya) * u_ya
-        t2 = (end_xb - start_xa) * u_xa + (end_yb - start_ya) * u_ya
+        t1 = (lines_b[F.start_x] - lines_a[F.start_x]) * lines_a[F.u_x] + \
+             (lines_b[F.start_y] - lines_a[F.start_y]) * lines_a[F.u_y]
+
+        t2 = (lines_b[F.end_x] - lines_a[F.start_x]) * lines_a[F.u_x] + \
+             (lines_b[F.end_y] - lines_a[F.start_y]) * lines_a[F.u_y]
 
         # Get the projected range
         tmin, tmax = torch.minimum(t1, t2), torch.maximum(t1, t2)
-        
+
         # Clip the projection range within [0, length_a]
         overlap_start = torch.clamp(tmin, min=0)
-        overlap_end = torch.clamp(tmax, max=length_a)
+        overlap_end = torch.clamp(tmax, max=lines_a[F.length])
         overlap_mid = (overlap_start + overlap_end) / 2
-        
+
         # Overlap ratio
         overlap_length = torch.clamp(overlap_end - overlap_start, min=0)
-        overlap_a_b = overlap_length / length_a
-        overlap_b_a = overlap_length / length_b
-        
+        overlap_a_b = overlap_length / lines_a[F.length]
+        overlap_b_a = overlap_length / lines_b[F.length]
+
         # Midpoint of projected overlap on line A
-        overlap_mid_xa = start_xa + u_xa * overlap_mid
-        overlap_mid_ya = start_ya + u_ya * overlap_mid
-        
+        overlap_mid_xa = lines_a[F.start_x] + lines_a[F.u_x] * overlap_mid
+        overlap_mid_ya = lines_a[F.start_y] + lines_a[F.u_y] * overlap_mid
+
         # Perpendicular distance to line B
-        dx = overlap_mid_xa - mid_xb
-        dy = overlap_mid_ya - mid_yb
+        dx = overlap_mid_xa - lines_b[F.mid_x]
+        dy = overlap_mid_ya - lines_b[F.mid_y]
+
+        # Perpendicular distances relative to overlaping segment midpoint
+        distance_a_b = dx * lines_b[F.n_x] + dy * lines_b[F.n_y]
+        distance_b_a = -dx * lines_a[F.n_x] - dy * lines_a[F.n_y]
         
-        distance = (dx * -u_yb + dy * u_xb).abs() # From overlaping segment midpoint on line_a to line_b
-        
-        return overlap_a_b, overlap_b_a, distance # Each: shape (n_pairs,)
+        return overlap_a_b, distance_a_b, overlap_b_a, distance_b_a # Each: shape (n_pairs,)
     
     def _get_line_arc_intersections(lines:Tensor, arcs:Tensor, margin:float) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, 
                                                                                       Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
@@ -380,7 +409,7 @@ class Graph:
         mask[mask1] = mask2
         mask[mask.clone()] = mask3
         
-        return lines, arcs, line_intersection_min, line_intersection_max, arc_intersection_min, arc_intersection_max, \
+        return lines, line_intersection_min, line_intersection_max, arcs, arc_intersection_min, arc_intersection_max, \
                angle_difference_sin_min, angle_difference_cos_min, angle_difference_sin_max, angle_difference_cos_max, mask
     
     @staticmethod
@@ -456,7 +485,7 @@ class Graph:
             if line_arc_pair.any():
                 lines_a, arcs_b = elements_a[:, line_arc_pair], elements_b[:, line_arc_pair]
                 
-                lines_a, arcs_b, line_intersection_min, line_intersection_max, arc_intersection_min, arc_intersection_max, \
+                lines_a, line_intersection_min, line_intersection_max, arcs_b, arc_intersection_min, arc_intersection_max, \
                 angle_b_a_sin_min, angle_b_a_cos_min, angle_b_a_sin_max, angle_b_a_cos_max, filter[line_arc_pair] = Graph._get_line_arc_intersections(lines_a, arcs_b, margin)
                 
                 # Update line_arc_pair
@@ -472,7 +501,7 @@ class Graph:
             if arc_line_pair.any():
                 arcs_a, lines_b = elements_a[:, arc_line_pair], elements_b[:, arc_line_pair]
                 
-                lines_b, arcs_a, line_intersection_min, line_intersection_max, arc_intersection_min, arc_intersection_max, \
+                lines_b, line_intersection_min, line_intersection_max, arcs_a, arc_intersection_min, arc_intersection_max, \
                 angle_b_a_sin_min, angle_b_a_cos_min, angle_b_a_sin_max, angle_b_a_cos_max, filter[arc_line_pair] = Graph._get_line_arc_intersections(lines_b, arcs_a, margin)
                 
                 # Update arc_line_pair
@@ -491,7 +520,7 @@ class Graph:
         angle_difference_b_a_sin_min, angle_difference_b_a_cos_min = angle_difference_b_a_sin_min[filter], angle_difference_b_a_cos_min[filter]
         angle_difference_b_a_sin_max, angle_difference_b_a_cos_max = angle_difference_b_a_sin_max[filter], angle_difference_b_a_cos_max[filter]
         
-        return elements_a, elements_b, intersection_a_min, intersection_a_max, intersection_b_min, intersection_b_max, \
+        return elements_a, intersection_a_min, intersection_a_max, elements_b, intersection_b_min, intersection_b_max, \
                angle_difference_b_a_sin_min, angle_difference_b_a_cos_min, angle_difference_b_a_sin_max, angle_difference_b_a_cos_max
     
     # Parameters
@@ -531,8 +560,7 @@ class Graph:
         angle_difference_b_a_cos = torch.cos(angle_difference_b_a)
         
         # Compute overlap ratio and perpendicular distance
-        overlap_a_b, overlap_b_a, distance = self.get_overlap_ratios(lines_a, lines_b)
-        distance = torch.hstack([distance, distance]) # For both edges_i_j and edges_j_i
+        overlap_a_b, distance_a_b, overlap_b_a, distance_b_a = self.get_overlap_ratios(lines_a, lines_b)
         
         # Create edges
         Att = _edge_attribute
@@ -547,14 +575,15 @@ class Graph:
         attributes = torch.zeros((n_edges, Att.count()), dtype=torch.float32)
         
         attributes[:, Att.parallel] = 1.0
-        attributes[:, Att.offset] = distance
         
+        attributes[:edges_i_j, Att.offset] = distance_a_b
         attributes[:edges_i_j, Att.overlap_ratio] = overlap_a_b
         attributes[:edges_i_j, Att.angle_difference_sin_min] = -angle_difference_b_a_sin
         attributes[:edges_i_j, Att.angle_difference_cos_min] = angle_difference_b_a_cos
         attributes[:edges_i_j, Att.angle_difference_sin_max] = -angle_difference_b_a_sin
         attributes[:edges_i_j, Att.angle_difference_cos_max] = angle_difference_b_a_cos
         
+        attributes[edges_j_i:, Att.offset] = distance_b_a
         attributes[edges_j_i:, Att.overlap_ratio] = overlap_b_a
         attributes[edges_j_i:, Att.angle_difference_sin_min] = angle_difference_b_a_sin
         attributes[edges_j_i:, Att.angle_difference_cos_min] = angle_difference_b_a_cos
@@ -577,14 +606,16 @@ class Graph:
         elements_a, elements_b = elements[:, i], elements[:, j]
         
         # Compute intersection positions
-        elements_a, elements_b, intersection_a_min, intersection_a_max, intersection_b_min, intersection_b_max, \
-        angle_difference_b_a_sin_min, angle_difference_b_a_cos_min,angle_difference_b_a_sin_max, angle_difference_b_a_cos_max \
+        elements_a, intersection_a_min, intersection_a_max, \
+        elements_b, intersection_b_min, intersection_b_max, \
+        angle_difference_b_a_sin_min, angle_difference_b_a_cos_min, \
+        angle_difference_b_a_sin_max, angle_difference_b_a_cos_max \
         = self.get_intersection_positions(elements_a, elements_b, margin=obb_width, angle_tolerance=angle_tolerance)
         
         # Create edges
         Att = _edge_attribute
         
-        i, j = elements_a[F.original_index], elements_b[F.original_index]
+        i, j = elements_a[F.original_index].long(), elements_b[F.original_index].long()
         
         edge_pairs = torch.hstack([torch.vstack([i, j]), torch.vstack([j, i])])
         
@@ -696,10 +727,10 @@ def CreateGraph(dxf_file):
     dataframe[F.mid_x] = torch.where(is_circle_or_arc, dataframe[F.center_x] + dataframe[F.radius] * torch.cos(mid_angle), dataframe[F.mid_x])
     dataframe[F.mid_y] = torch.where(is_circle_or_arc, dataframe[F.center_y] + dataframe[F.radius] * torch.sin(mid_angle), dataframe[F.mid_y])
     
-    dataframe[F.u_x] = torch.where(is_circle_or_arc, (dataframe[F.mid_x] - dataframe[F.center_x]) / dataframe[F.radius], dataframe[F.u_x])
-    dataframe[F.u_y] = torch.where(is_circle_or_arc, (dataframe[F.mid_y] - dataframe[F.center_y]) / dataframe[F.radius], dataframe[F.u_y])
-    dataframe[F.n_x] = torch.where(is_circle_or_arc, -dataframe[F.u_y], dataframe[F.n_x])
-    dataframe[F.n_y] = torch.where(is_circle_or_arc, dataframe[F.u_x], dataframe[F.n_y])
+    dataframe[F.r_x] = torch.where(is_circle_or_arc, (dataframe[F.mid_x] - dataframe[F.center_x]) / dataframe[F.radius], dataframe[F.r_x])
+    dataframe[F.r_y] = torch.where(is_circle_or_arc, (dataframe[F.mid_y] - dataframe[F.center_y]) / dataframe[F.radius], dataframe[F.r_y])
+    dataframe[F.t_x] = torch.where(is_circle_or_arc, -dataframe[F.r_y], dataframe[F.t_x])
+    dataframe[F.t_y] = torch.where(is_circle_or_arc, dataframe[F.r_x], dataframe[F.t_y])
     
     dataframe[F.perimeter] = torch.where(is_circle_or_arc, dataframe[F.radius] * dataframe[F.arc_span], dataframe[F.perimeter])
     
