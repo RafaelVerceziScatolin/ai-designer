@@ -33,16 +33,15 @@ class _dataframe_field(IntEnum):
 
 class _edge_attribute(IntEnum):
     parallel = 0
-    colinear = 1
-    perpendicular_distance = 2
-    overlap_ratio = 3
-    oblique = 4
-    intersection_min = 5
-    intersection_max = 6
-    angle_difference_sin_min = 7
-    angle_difference_cos_min = 8
-    angle_difference_sin_max = 9
-    angle_difference_cos_max = 10
+    offset = 1
+    overlap_ratio = 2
+    oblique = 3
+    intersection_min = 4
+    intersection_max = 5
+    angle_difference_sin_min = 6
+    angle_difference_cos_min = 7
+    angle_difference_sin_max = 8
+    angle_difference_cos_max = 9
     
     @classmethod
     def count(cls) -> int: return len(cls)
@@ -51,6 +50,7 @@ from typing import Tuple
 import torch
 from torch import Tensor
 from torch import newaxis
+torch.set_default_device('cuda')
 
 class Graph:
     def __init__(self, dataframe:Tensor):
@@ -58,8 +58,8 @@ class Graph:
         Att = _edge_attribute
         
         self._dataframe = dataframe
-        self.edge_pairs = torch.empty([2, 0], dtype=torch.long, device='cuda')
-        self.attributes = torch.empty([0, Att.count()], dtype=torch.float32, device='cuda')
+        self.edge_pairs = torch.empty([2, 0], dtype=torch.long)
+        self.attributes = torch.empty([0, Att.count()], dtype=torch.float32)
         
         functions = [
             self.DetectParallel,
@@ -70,9 +70,7 @@ class Graph:
             edge_pairs, attributes = function()
             self.edge_pairs = torch.hstack([self.edge_pairs, edge_pairs])
             self.attributes = torch.vstack([self.attributes, attributes])
-        
-        
-        
+          
     @staticmethod
     def create_obbs(elements:Tensor, width:float, length_extension:float=0.0) -> Tuple[Tensor, Tensor]:
         
@@ -85,7 +83,7 @@ class Graph:
         
         filter = is_line | is_circle_or_arc
         
-        obbs = torch.empty((n_elements, 4, 2), dtype=torch.float32, device='cuda')
+        obbs = torch.empty((n_elements, 4, 2), dtype=torch.float32)
         
         if is_line.any():
             # === LINE ELEMENTS ===
@@ -378,7 +376,7 @@ class Graph:
         line_intersection_min = torch.clamp(t_min / lines[F.length], min=0, max=1)
         line_intersection_max = torch.clamp(t_max / lines[F.length], min=0, max=1)
         
-        mask = torch.zeros_like(mask1, dtype=torch.bool, device='cuda')
+        mask = torch.zeros_like(mask1, dtype=torch.bool)
         mask[mask1] = mask2
         mask[mask.clone()] = mask3
         
@@ -403,15 +401,15 @@ class Graph:
         
         filter = line_line_pair | (line_arc_pair | arc_line_pair)
         
-        intersection_a_min = torch.empty(n_pairs, dtype=torch.float32, device='cuda')
-        intersection_a_max = torch.empty(n_pairs, dtype=torch.float32, device='cuda')
-        intersection_b_min = torch.empty(n_pairs, dtype=torch.float32, device='cuda')
-        intersection_b_max = torch.empty(n_pairs, dtype=torch.float32, device='cuda')
+        intersection_a_min = torch.empty(n_pairs, dtype=torch.float32)
+        intersection_a_max = torch.empty(n_pairs, dtype=torch.float32)
+        intersection_b_min = torch.empty(n_pairs, dtype=torch.float32)
+        intersection_b_max = torch.empty(n_pairs, dtype=torch.float32)
         
-        angle_difference_b_a_sin_min = torch.empty(n_pairs, dtype=torch.float32, device='cuda')
-        angle_difference_b_a_cos_min = torch.empty(n_pairs, dtype=torch.float32, device='cuda')
-        angle_difference_b_a_sin_max = torch.empty(n_pairs, dtype=torch.float32, device='cuda')
-        angle_difference_b_a_cos_max = torch.empty(n_pairs, dtype=torch.float32, device='cuda')
+        angle_difference_b_a_sin_min = torch.empty(n_pairs, dtype=torch.float32)
+        angle_difference_b_a_cos_min = torch.empty(n_pairs, dtype=torch.float32)
+        angle_difference_b_a_sin_max = torch.empty(n_pairs, dtype=torch.float32)
+        angle_difference_b_a_cos_max = torch.empty(n_pairs, dtype=torch.float32)
         
         if line_line_pair.any():
             lines_a = elements_a[:, line_line_pair]
@@ -496,12 +494,15 @@ class Graph:
         return elements_a, elements_b, intersection_a_min, intersection_a_max, intersection_b_min, intersection_b_max, \
                angle_difference_b_a_sin_min, angle_difference_b_a_cos_min, angle_difference_b_a_sin_max, angle_difference_b_a_cos_max
     
+    # Parameters
     line_obb_width=0.5
+    parallel_max_offset=25.
     parallel_angle_tolerance=0.01
     
-    def DetectParallel(self, offset=25, angle_tolerance=None, colinear_threshold=0.5):
+    def DetectParallel(self, max_offset=None, angle_tolerance=None) -> Tuple[Tensor, Tensor]:
         F = _dataframe_field
         dataframe = self._dataframe
+        max_offset = max_offset or self.parallel_max_offset
         angle_tolerance = (angle_tolerance or self.parallel_angle_tolerance) * torch.pi/180
         
         # Filter valid line indices
@@ -509,7 +510,7 @@ class Graph:
         lines = dataframe[:, is_line]
         
         # Compute OBBs
-        lines, obbs = self.create_obbs(elements=lines, width=offset, length_extension=self.line_obb_width) # Shape obbs (n_lines, 4, 2)
+        lines, obbs = self.create_obbs(elements=lines, width=max_offset, length_extension=self.line_obb_width) # Shape obbs (n_lines, 4, 2)
         
         # Get the pairs of overlapping obbs
         i, j = self.find_overlaping_pairs(lines, obbs)
@@ -526,8 +527,8 @@ class Graph:
         angle_difference_b_a = angle_difference_b_a[parallel]
         
         # get the angle difference sin and cos
-        angle_difference_b_a_sin_min = angle_difference_b_a_sin_max = torch.sin(angle_difference_b_a)
-        angle_difference_b_a_cos_min = angle_difference_b_a_cos_max = torch.cos(angle_difference_b_a)
+        angle_difference_b_a_sin = torch.sin(angle_difference_b_a)
+        angle_difference_b_a_cos = torch.cos(angle_difference_b_a)
         
         # Compute overlap ratio and perpendicular distance
         overlap_a_b, overlap_b_a, distance = self.get_overlap_ratios(lines_a, lines_b)
@@ -540,29 +541,29 @@ class Graph:
         
         edge_pairs = torch.hstack([torch.vstack([i, j]), torch.vstack([j, i])])
         
-        edges_i_j = edges_j_i = int(edge_pairs.size(1) / 2)
+        n_edges = edge_pairs.size(1)
+        edges_i_j = edges_j_i = int(n_edges / 2)
         
-        attributes = torch.zeros((edges_i_j + edges_j_i, Att.count()), dtype=torch.float32, device='cuda')
+        attributes = torch.zeros((n_edges, Att.count()), dtype=torch.float32)
         
         attributes[:, Att.parallel] = 1.0
-        attributes[:, Att.colinear] = torch.where(distance < colinear_threshold, 1, 0)
-        attributes[:, Att.perpendicular_distance] = distance
+        attributes[:, Att.offset] = distance
         
         attributes[:edges_i_j, Att.overlap_ratio] = overlap_a_b
-        attributes[:edges_i_j, Att.angle_difference_sin_min] = -angle_difference_b_a_sin_min
-        attributes[:edges_i_j, Att.angle_difference_cos_min] = angle_difference_b_a_cos_min
-        attributes[:edges_i_j, Att.angle_difference_sin_max] = -angle_difference_b_a_sin_max
-        attributes[:edges_i_j, Att.angle_difference_cos_max] = angle_difference_b_a_cos_max
+        attributes[:edges_i_j, Att.angle_difference_sin_min] = -angle_difference_b_a_sin
+        attributes[:edges_i_j, Att.angle_difference_cos_min] = angle_difference_b_a_cos
+        attributes[:edges_i_j, Att.angle_difference_sin_max] = -angle_difference_b_a_sin
+        attributes[:edges_i_j, Att.angle_difference_cos_max] = angle_difference_b_a_cos
         
         attributes[edges_j_i:, Att.overlap_ratio] = overlap_b_a
-        attributes[edges_j_i:, Att.angle_difference_sin_min] = angle_difference_b_a_sin_min
-        attributes[edges_j_i:, Att.angle_difference_cos_min] = angle_difference_b_a_cos_min
-        attributes[edges_j_i:, Att.angle_difference_sin_max] = angle_difference_b_a_sin_max
-        attributes[edges_j_i:, Att.angle_difference_cos_max] = angle_difference_b_a_cos_max
+        attributes[edges_j_i:, Att.angle_difference_sin_min] = angle_difference_b_a_sin
+        attributes[edges_j_i:, Att.angle_difference_cos_min] = angle_difference_b_a_cos
+        attributes[edges_j_i:, Att.angle_difference_sin_max] = angle_difference_b_a_sin
+        attributes[edges_j_i:, Att.angle_difference_cos_max] = angle_difference_b_a_cos
         
         return edge_pairs, attributes
      
-    def DetectIntersection(self, obb_width=None, angle_tolerance=None):
+    def DetectIntersection(self, obb_width=None, angle_tolerance=None) -> Tuple[Tensor, Tensor]:
         F = _dataframe_field
         dataframe = self._dataframe
         obb_width = obb_width or self.line_obb_width
@@ -587,9 +588,10 @@ class Graph:
         
         edge_pairs = torch.hstack([torch.vstack([i, j]), torch.vstack([j, i])])
         
-        edges_i_j = edges_j_i = int(edge_pairs.size(1) / 2)
+        n_edges = edge_pairs.size(1)
+        edges_i_j = edges_j_i = int(n_edges / 2)
         
-        attributes = torch.zeros((edges_i_j + edges_j_i, Att.count()), dtype=torch.float32, device='cuda')
+        attributes = torch.zeros((n_edges, Att.count()), dtype=torch.float32)
         
         attributes[:, Att.oblique] = 1.0
 
@@ -619,7 +621,7 @@ def CreateGraph(dxf_file):
     entities = [entity for entity in modelSpace if entity.dxftype() in ('LINE', 'POINT', 'CIRCLE', 'ARC')]
     
     F = _dataframe_field
-    dataframe = torch.zeros((F.count(), len(entities)), dtype=torch.float32, device='cuda')
+    dataframe = torch.zeros((F.count(), len(entities)), dtype=torch.float32)
     
     for i, entity in enumerate(entities):
         dataframe[F.original_index,i] = i
