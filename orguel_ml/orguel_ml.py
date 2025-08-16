@@ -3,30 +3,31 @@ from enum import IntEnum
 
 class _dataframe_field(IntEnum):
     original_index = 0
-    line_flag = 1
-    circle_flag = 2
-    arc_flag = 3
-    point_flag = 4
-    start_x = 5
-    start_y = 6
-    end_x = 7
-    end_y = 8
-    mid_x = 9
-    mid_y = 10
-    angle = 11
-    length = perimeter = 12
-    d_x = 13
-    d_y = 14
-    u_x = t_x = 15
-    u_y = t_y = 16
-    n_x = r_x = 17
-    n_y = r_y = 18
-    center_x = 19
-    center_y = 20
-    radius = 21
-    start_angle = 22
-    end_angle = 23
-    arc_span = 24
+    layer = 1
+    line_flag = 2
+    circle_flag = 3
+    arc_flag = 4
+    point_flag = 5
+    start_x = 6
+    start_y = 7
+    end_x = 8
+    end_y = 9
+    mid_x = 10
+    mid_y = 11
+    angle = 12
+    length = perimeter = 13
+    d_x = 14
+    d_y = 15
+    u_x = t_x = 16
+    u_y = t_y = 17
+    n_x = r_x = 18
+    n_y = r_y = 19
+    center_x = 20
+    center_y = 21
+    radius = 22
+    start_angle = 23
+    end_angle = 24
+    arc_span = 25
     
     @classmethod
     def count(cls) -> int: return len(cls)
@@ -47,9 +48,9 @@ class _edge_attribute(IntEnum):
     def count(cls) -> int: return len(cls)
 
 from typing import Tuple
+import math
 import torch
-from torch import Tensor
-from torch import newaxis
+from torch import Tensor, newaxis
 torch.set_default_device('cuda')
 
 class Graph:
@@ -107,7 +108,7 @@ class Graph:
         self.node_attributes = torch.hstack([line_flag, arc_flag, normalized_coordinates, normalized_length, direction])
         
     @staticmethod
-    def create_obbs(elements:Tensor, width:float, length_extension:float=0.0) -> Tuple[Tensor, Tensor]:
+    def create_obbs(elements:Tensor, width:float, length_extension:float=0.) -> Tuple[Tensor, Tensor]:
         
         F = _dataframe_field
         n_elements = elements.size(1)
@@ -524,6 +525,7 @@ class Graph:
                angle_difference_b_a_sin_min, angle_difference_b_a_cos_min, angle_difference_b_a_sin_max, angle_difference_b_a_cos_max
     
     # Parameters
+    p95_length=450.
     line_obb_width=0.5
     parallel_max_offset=25.
     parallel_angle_tolerance=0.01
@@ -532,7 +534,7 @@ class Graph:
         F = _dataframe_field
         dataframe = self._dataframe
         max_offset = max_offset or self.parallel_max_offset
-        angle_tolerance = (angle_tolerance or self.parallel_angle_tolerance) * torch.pi/180
+        angle_tolerance = math.radians(angle_tolerance or self.parallel_angle_tolerance)
         
         # Filter valid line indices
         is_line = dataframe[F.line_flag] == 1
@@ -596,7 +598,7 @@ class Graph:
         F = _dataframe_field
         dataframe = self._dataframe
         obb_width = obb_width or self.line_obb_width
-        angle_tolerance = (angle_tolerance or self.parallel_angle_tolerance) * torch.pi/180
+        angle_tolerance = math.radians(angle_tolerance or self.parallel_angle_tolerance)
         
         # Compute OBBs
         elements, obbs = self.create_obbs(elements=dataframe, width=obb_width, length_extension=obb_width) # Shape obbs (n_lines, 4, 2)
@@ -643,20 +645,28 @@ class Graph:
         return edge_pairs, attributes
         
 import ezdxf
+from torch_geometric.data import Data
 
-def CreateGraph(dxf_file):
+def CreateGraph(dxf_file, rotation=0., mirror_axis=None, device='cuda') -> Data:
+    rotation = math.radians(rotation)
+    supported_entities = ('LINE', 'POINT', 'CIRCLE', 'ARC')
+    supported_layers = {"beam": 0, "column": 1, "eave": 2, "hole_slab": 3, "stair": 4, "section": 5, "info": 6}
     
     doc = ezdxf.readfile(dxf_file)
-    modelSpace = doc.modelspace()
+    modelspace = doc.modelspace()
     
-    entities = [entity for entity in modelSpace if entity.dxftype() in ('LINE', 'POINT', 'CIRCLE', 'ARC')]
+    entities = [entity for entity in modelspace if entity.dxftype() in supported_entities]
     
     F = _dataframe_field
-    dataframe = torch.zeros((F.count(), len(entities)), dtype=torch.float32)
+    dataframe = torch.zeros((F.count(), len(entities)), dtype=torch.float32, device='cpu')
     
     for i, entity in enumerate(entities):
         dataframe[F.original_index,i] = i
         entity_type = entity.dxftype()
+        entity_layer = entity.dxf.layer
+        
+        if entity_layer in supported_layers: dataframe[F.layer,i] = supported_layers[entity_layer]
+        else: dataframe[F.layer,i] = -1; print(f"[Unsupported layer] '{entity_layer}' in file '{dxf_file}'")
         
         if entity_type == 'LINE':
             dataframe[F.line_flag,i] = 1
@@ -665,7 +675,7 @@ def CreateGraph(dxf_file):
         
         elif entity_type == 'POINT':
             dataframe[F.point_flag,i] = 1
-            dataframe[F.mid_x,i], dataframe[F.mid_y,i], _ = entity.dxf.location
+            dataframe[F.start_x,i], dataframe[F.start_y,i], _ = entity.dxf.location
             
         elif entity_type in ('CIRCLE', 'ARC'):
             dataframe[F.circle_flag,i] = 1 if entity_type == 'CIRCLE' else 0
@@ -674,7 +684,33 @@ def CreateGraph(dxf_file):
             dataframe[F.center_x,i], dataframe[F.center_y,i], _ = entity.dxf.center
             dataframe[F.start_angle,i] = 0 if entity_type == 'CIRCLE' else entity.dxf.start_angle
             dataframe[F.end_angle,i] = 360 if entity_type == 'CIRCLE' else entity.dxf.end_angle
-            
+    
+    dataframe = dataframe.to(device)
+    
+    # Apply mirror
+    if mirror_axis == 'x':
+        dataframe[F.start_y], dataframe[F.end_y], dataframe[F.center_y] = -dataframe[F.start_y], -dataframe[F.end_y], -dataframe[F.center_y]
+        dataframe[F.start_angle], dataframe[F.end_angle] = (-dataframe[F.end_angle] % 360, -dataframe[F.start_angle] % 360)
+    elif mirror_axis == 'y':
+        dataframe[F.start_x], dataframe[F.end_x], dataframe[F.center_x] = -dataframe[F.start_x], -dataframe[F.end_x], -dataframe[F.center_x]
+        dataframe[F.start_angle], dataframe[F.end_angle] = ((180 - dataframe[F.end_angle]) % 360, (180 - dataframe[F.start_angle]) % 360)
+    
+    # Rotate coordinates
+    rotation_sin, rotation_cos = math.sin(rotation), math.cos(rotation)
+
+    dataframe[F.start_x], dataframe[F.start_y] = (dataframe[F.start_x] * rotation_cos - dataframe[F.start_y] * rotation_sin, \
+                                                  dataframe[F.start_x] * rotation_sin + dataframe[F.start_y] * rotation_cos)
+
+    dataframe[F.end_x], dataframe[F.end_y] = (dataframe[F.end_x] * rotation_cos - dataframe[F.end_y] * rotation_sin, \
+                                              dataframe[F.end_x] * rotation_sin + dataframe[F.end_y] * rotation_cos)
+
+    dataframe[F.center_x], dataframe[F.center_y] = (dataframe[F.center_x] * rotation_cos - dataframe[F.center_y] * rotation_sin, \
+                                                    dataframe[F.center_x] * rotation_sin + dataframe[F.center_y] * rotation_cos)
+
+    # Convert angles to radians and rotate
+    dataframe[F.start_angle] = (torch.deg2rad(dataframe[F.start_angle]) + rotation) % (2*torch.pi)
+    dataframe[F.end_angle] = (torch.deg2rad(dataframe[F.end_angle]) + rotation) % (2*torch.pi)
+    
     # === LINES ===
     is_line = dataframe[F.line_flag] == 1
     
@@ -699,8 +735,8 @@ def CreateGraph(dxf_file):
     # === POINTS ===
     is_point = dataframe[F.point_flag] == 1
     
-    for field in [F.start_x, F.end_x]: dataframe[field] = torch.where(is_point, dataframe[F.mid_x], dataframe[field])
-    for field in [F.start_y, F.end_y]: dataframe[field] = torch.where(is_point, dataframe[F.mid_y], dataframe[field])
+    for field in [F.end_x, F.mid_x]: dataframe[field] = torch.where(is_point, dataframe[F.start_x], dataframe[field])
+    for field in [F.end_y, F.mid_y]: dataframe[field] = torch.where(is_point, dataframe[F.start_y], dataframe[field])
     
     is_line_point = (dataframe[F.line_flag] == 1) & (dataframe[F.length] <= min_length)
     
@@ -711,9 +747,6 @@ def CreateGraph(dxf_file):
     is_circle = dataframe[F.circle_flag] == 1
     is_arc = dataframe[F.arc_flag] == 1
     is_circle_or_arc = is_circle | is_arc
-    
-    dataframe[F.start_angle] = torch.where(is_circle_or_arc, torch.deg2rad(dataframe[F.start_angle]), dataframe[F.start_angle])
-    dataframe[F.end_angle] = torch.where(is_circle_or_arc, torch.deg2rad(dataframe[F.end_angle]), dataframe[F.end_angle])
     
     dataframe[F.arc_span] = torch.where(is_circle, 2 * torch.pi, dataframe[F.arc_span])
     dataframe[F.arc_span] = torch.where(is_arc, ((dataframe[F.end_angle] - dataframe[F.start_angle]) % (2*torch.pi)), dataframe[F.arc_span])
@@ -736,4 +769,4 @@ def CreateGraph(dxf_file):
     
     graph = Graph(dataframe)
     
-    
+    return Data(x=graph.node_attributes, edge_index=graph.edge_pairs, edge_attr=graph.edge_attributes, y=dataframe[F.layer].long())
