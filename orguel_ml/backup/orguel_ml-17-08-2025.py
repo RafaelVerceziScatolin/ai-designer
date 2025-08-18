@@ -51,6 +51,7 @@ from typing import Tuple
 import math
 import torch
 from torch import Tensor, newaxis
+torch.set_default_device('cuda')
 
 class Graph:
     def __init__(self, dataframe:Tensor):
@@ -59,13 +60,12 @@ class Graph:
         Att = _edge_attribute
         
         self._dataframe = dataframe
-        self._device = dataframe.device
-        self.edge_pairs = torch.empty([2, 0], dtype=torch.long, device=self._device)
-        self.edge_attributes = torch.empty([0, Att.count()], dtype=torch.float32, device=self._device)
+        self.edge_pairs = torch.empty([2, 0], dtype=torch.long)
+        self.edge_attributes = torch.empty([0, Att.count()], dtype=torch.float32)
         
         functions = [
-            self.detect_parallel,
-            self.detect_intersection
+            self.DetectParallel,
+            self.DetectIntersection
         ]
         
         for function in functions:
@@ -106,7 +106,7 @@ class Graph:
         
         # Node attributes
         self.node_attributes = torch.hstack([line_flag, arc_flag, normalized_coordinates, normalized_length, direction])
-    
+        
     @staticmethod
     def create_obbs(elements:Tensor, width:float, length_extension:float=0.) -> Tuple[Tensor, Tensor]:
         
@@ -119,7 +119,7 @@ class Graph:
         
         filter = is_line | is_circle_or_arc
         
-        obbs = torch.empty((n_elements, 4, 2), dtype=torch.float32, device=elements.device)
+        obbs = torch.empty((n_elements, 4, 2), dtype=torch.float32)
         
         if is_line.any():
             # === LINE ELEMENTS ===
@@ -274,7 +274,6 @@ class Graph:
         
         return overlap_a_b, distance_a_b, overlap_b_a, distance_b_a # Each: shape (n_pairs,)
     
-    @staticmethod
     def _get_line_arc_intersections(lines:Tensor, arcs:Tensor, margin:float) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, 
                                                                                       Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
         
@@ -407,7 +406,7 @@ class Graph:
         line_intersection_min = torch.clamp(t_min / lines[F.length], min=0, max=1)
         line_intersection_max = torch.clamp(t_max / lines[F.length], min=0, max=1)
         
-        mask = torch.zeros_like(mask1, dtype=torch.bool, device=lines.device)
+        mask = torch.zeros_like(mask1, dtype=torch.bool)
         mask[mask1] = mask2
         mask[mask.clone()] = mask3
         
@@ -419,7 +418,6 @@ class Graph:
         Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
         
         F = _dataframe_field
-        device = elements_a.device
         n_pairs = elements_a.size(1)
         
         # Filter supported pairs
@@ -433,15 +431,15 @@ class Graph:
         
         filter = line_line_pair | (line_arc_pair | arc_line_pair)
         
-        intersection_a_min = torch.empty(n_pairs, dtype=torch.float32, device=device)
-        intersection_a_max = torch.empty(n_pairs, dtype=torch.float32, device=device)
-        intersection_b_min = torch.empty(n_pairs, dtype=torch.float32, device=device)
-        intersection_b_max = torch.empty(n_pairs, dtype=torch.float32, device=device)
+        intersection_a_min = torch.empty(n_pairs, dtype=torch.float32)
+        intersection_a_max = torch.empty(n_pairs, dtype=torch.float32)
+        intersection_b_min = torch.empty(n_pairs, dtype=torch.float32)
+        intersection_b_max = torch.empty(n_pairs, dtype=torch.float32)
         
-        angle_difference_b_a_sin_min = torch.empty(n_pairs, dtype=torch.float32, device=device)
-        angle_difference_b_a_cos_min = torch.empty(n_pairs, dtype=torch.float32, device=device)
-        angle_difference_b_a_sin_max = torch.empty(n_pairs, dtype=torch.float32, device=device)
-        angle_difference_b_a_cos_max = torch.empty(n_pairs, dtype=torch.float32, device=device)
+        angle_difference_b_a_sin_min = torch.empty(n_pairs, dtype=torch.float32)
+        angle_difference_b_a_cos_min = torch.empty(n_pairs, dtype=torch.float32)
+        angle_difference_b_a_sin_max = torch.empty(n_pairs, dtype=torch.float32)
+        angle_difference_b_a_cos_max = torch.empty(n_pairs, dtype=torch.float32)
         
         if line_line_pair.any():
             lines_a = elements_a[:, line_line_pair]
@@ -532,7 +530,7 @@ class Graph:
     parallel_max_offset=25.
     parallel_angle_tolerance=0.01
     
-    def detect_parallel(self, max_offset=None, angle_tolerance=None) -> Tuple[Tensor, Tensor]:
+    def DetectParallel(self, max_offset=None, angle_tolerance=None) -> Tuple[Tensor, Tensor]:
         F = _dataframe_field
         dataframe = self._dataframe
         max_offset = max_offset or self.parallel_max_offset
@@ -576,7 +574,7 @@ class Graph:
         n_edges = edge_pairs.size(1)
         edges_i_j = edges_j_i = int(n_edges / 2)
         
-        attributes = torch.zeros((n_edges, Att.count()), dtype=torch.float32, device=self._device)
+        attributes = torch.zeros((n_edges, Att.count()), dtype=torch.float32)
         
         attributes[:, Att.parallel] = 1.0
         
@@ -596,7 +594,7 @@ class Graph:
         
         return edge_pairs, attributes
      
-    def detect_intersection(self, obb_width=None, angle_tolerance=None) -> Tuple[Tensor, Tensor]:
+    def DetectIntersection(self, obb_width=None, angle_tolerance=None) -> Tuple[Tensor, Tensor]:
         F = _dataframe_field
         dataframe = self._dataframe
         obb_width = obb_width or self.line_obb_width
@@ -626,7 +624,7 @@ class Graph:
         n_edges = edge_pairs.size(1)
         edges_i_j = edges_j_i = int(n_edges / 2)
         
-        attributes = torch.zeros((n_edges, Att.count()), dtype=torch.float32, device=self._device)
+        attributes = torch.zeros((n_edges, Att.count()), dtype=torch.float32)
         
         attributes[:, Att.oblique] = 1.0
 
@@ -645,13 +643,14 @@ class Graph:
         attributes[edges_j_i:, Att.angle_difference_cos_max] = angle_difference_b_a_cos_max
         
         return edge_pairs, attributes
-     
+        
 import ezdxf
+from torch_geometric.data import Data
 
-supported_entities = ('LINE', 'POINT', 'CIRCLE', 'ARC')
-supported_layers = {"beam": 0, "column": 1, "eave": 2, "hole_slab": 3, "stair": 4, "section": 5, "info": 6}
-
-def extract_coordinates(dxf_file):
+def CreateGraph(dxf_file, rotation=0., mirror_axis=None, device='cuda') -> Data:
+    rotation = math.radians(rotation)
+    supported_entities = ('LINE', 'POINT', 'CIRCLE', 'ARC')
+    supported_layers = {"beam": 0, "column": 1, "eave": 2, "hole_slab": 3, "stair": 4, "section": 5, "info": 6}
     
     doc = ezdxf.readfile(dxf_file)
     modelspace = doc.modelspace()
@@ -685,16 +684,7 @@ def extract_coordinates(dxf_file):
             dataframe[F.center_x,i], dataframe[F.center_y,i], _ = entity.dxf.center
             dataframe[F.start_angle,i] = 0 if entity_type == 'CIRCLE' else entity.dxf.start_angle
             dataframe[F.end_angle,i] = 360 if entity_type == 'CIRCLE' else entity.dxf.end_angle
-        
-    return dataframe
-
-from torch_geometric.data import Data
-
-def create_graph(dataframe:Tensor, rotation=0., mirror_axis=None, device='cpu'):
     
-    rotation = math.radians(rotation)
-    
-    F = _dataframe_field
     dataframe = dataframe.to(device)
     
     # Apply mirror
@@ -780,29 +770,3 @@ def create_graph(dataframe:Tensor, rotation=0., mirror_axis=None, device='cpu'):
     graph = Graph(dataframe)
     
     return Data(x=graph.node_attributes, edge_index=graph.edge_pairs, edge_attr=graph.edge_attributes, y=dataframe[F.layer].long())
-
-import os
-from tqdm import tqdm
-from multiprocessing import Pool
-
-def _worker(): torch.set_num_threads(1); os.environ.setdefault("OMP_NUM_THREADS", "1")
-
-class CoordinateDataset(torch.utils.data.Dataset):
-    def __init__(self, dxf_files):
-        
-        self.dataset = []
-        
-        n_cpu = os.cpu_count()
-        n_files = len(dxf_files)
-        chunksize = max(1, n_files // (n_cpu * 4))
-        
-        with Pool(processes=n_cpu, initializer=_worker, maxtasksperchild=100) as pool:
-            for dataframe in tqdm(pool.imap_unordered(extract_coordinates, dxf_files, chunksize=chunksize), total=n_files, desc="Extracting coordinates"):
-                self.dataset.append(dataframe)
-    
-    def __len__(self):
-        return len(self.dataset)
-    
-    def __getitem__(self, idx):
-        return self.dataset[idx]
-
