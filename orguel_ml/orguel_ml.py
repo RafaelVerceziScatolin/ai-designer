@@ -1,7 +1,6 @@
-
 from enum import IntEnum
 
-class _dataframe_field(IntEnum):
+class _DataframeField(IntEnum):
     original_index = 0
     layer = 1
     line_flag = 2
@@ -32,7 +31,7 @@ class _dataframe_field(IntEnum):
     @classmethod
     def count(cls) -> int: return len(cls)
 
-class _edge_attribute(IntEnum):
+class _EdgeAttribute(IntEnum):
     parallel = 0
     offset = 1
     overlap_ratio = 2
@@ -47,7 +46,7 @@ class _edge_attribute(IntEnum):
     @classmethod
     def count(cls) -> int: return len(cls)
 
-from typing import Tuple
+from typing import Tuple, List
 import math
 import torch
 from torch import Tensor, newaxis
@@ -55,8 +54,8 @@ from torch import Tensor, newaxis
 class Graph:
     def __init__(self, dataframe:Tensor):
         
-        F = _dataframe_field
-        Att = _edge_attribute
+        F = _DataframeField
+        Att = _EdgeAttribute
         
         self._dataframe = dataframe
         self._device = dataframe.device
@@ -110,7 +109,7 @@ class Graph:
     @staticmethod
     def create_obbs(elements:Tensor, width:float, length_extension:float=0.) -> Tuple[Tensor, Tensor]:
         
-        F = _dataframe_field
+        F = _DataframeField
         n_elements = elements.size(1)
         
         # Filter supported elements
@@ -191,7 +190,7 @@ class Graph:
     @staticmethod
     def find_overlaping_pairs(elements:Tensor, obbs:Tensor) -> Tuple[Tensor, Tensor]:
         
-        F = _dataframe_field
+        F = _DataframeField
         
         # Compute AABBs (Axis-Aligned Bounding Boxes)
         min_x = obbs[..., 0].min(dim=1).values
@@ -238,7 +237,7 @@ class Graph:
     @staticmethod
     def get_overlap_ratios(lines_a:Tensor, lines_b:Tensor) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
         
-        F = _dataframe_field
+        F = _DataframeField
         
         # Project B's endpoints onto A
         t1 = (lines_b[F.start_x] - lines_a[F.start_x]) * lines_a[F.u_x] + \
@@ -278,7 +277,7 @@ class Graph:
     def _get_line_arc_intersections(lines:Tensor, arcs:Tensor, margin:float) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, 
                                                                                       Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
         
-        F = _dataframe_field
+        F = _DataframeField
         
         dx_start = arcs[F.center_x] - lines[F.start_x]
         dy_start = arcs[F.center_y] - lines[F.start_y]
@@ -418,7 +417,7 @@ class Graph:
     def get_intersection_positions(elements_a:Tensor, elements_b:Tensor, margin:float, angle_tolerance:float) -> \
         Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
         
-        F = _dataframe_field
+        F = _DataframeField
         device = elements_a.device
         n_pairs = elements_a.size(1)
         
@@ -533,7 +532,7 @@ class Graph:
     parallel_angle_tolerance=0.01
     
     def detect_parallel(self, max_offset=None, angle_tolerance=None) -> Tuple[Tensor, Tensor]:
-        F = _dataframe_field
+        F = _DataframeField
         dataframe = self._dataframe
         max_offset = max_offset or self.parallel_max_offset
         angle_tolerance = math.radians(angle_tolerance or self.parallel_angle_tolerance)
@@ -567,7 +566,7 @@ class Graph:
         overlap_a_b, distance_a_b, overlap_b_a, distance_b_a = self.get_overlap_ratios(lines_a, lines_b)
         
         # Create edges
-        Att = _edge_attribute
+        Att = _EdgeAttribute
         
         i, j = lines_a[F.original_index].long(), lines_b[F.original_index].long()
         
@@ -597,7 +596,7 @@ class Graph:
         return edge_pairs, attributes
      
     def detect_intersection(self, obb_width=None, angle_tolerance=None) -> Tuple[Tensor, Tensor]:
-        F = _dataframe_field
+        F = _DataframeField
         dataframe = self._dataframe
         obb_width = obb_width or self.line_obb_width
         angle_tolerance = math.radians(angle_tolerance or self.parallel_angle_tolerance)
@@ -617,7 +616,7 @@ class Graph:
         = self.get_intersection_positions(elements_a, elements_b, margin=obb_width, angle_tolerance=angle_tolerance)
         
         # Create edges
-        Att = _edge_attribute
+        Att = _EdgeAttribute
         
         i, j = elements_a[F.original_index].long(), elements_b[F.original_index].long()
         
@@ -651,14 +650,14 @@ import ezdxf
 supported_entities = ('LINE', 'POINT', 'CIRCLE', 'ARC')
 supported_layers = {"beam": 0, "column": 1, "eave": 2, "hole_slab": 3, "stair": 4, "section": 5, "info": 6}
 
-def extract_coordinates(dxf_file):
+def extract_coordinates(dxf_file) -> Tensor:
     
     doc = ezdxf.readfile(dxf_file)
     modelspace = doc.modelspace()
     
     entities = [entity for entity in modelspace if entity.dxftype() in supported_entities]
     
-    F = _dataframe_field
+    F = _DataframeField
     dataframe = torch.zeros((F.count(), len(entities)), dtype=torch.float32, device='cpu')
     
     for i, entity in enumerate(entities):
@@ -690,12 +689,11 @@ def extract_coordinates(dxf_file):
 
 from torch_geometric.data import Data
 
-def create_graph(dataframe:Tensor, rotation=0., mirror_axis=None, device='cpu'):
+def create_graph(dataframe:Tensor, rotation=0., mirror_axis=None) -> Data:
+    
+    F = _DataframeField
     
     rotation = math.radians(rotation)
-    
-    F = _dataframe_field
-    dataframe = dataframe.to(device)
     
     # Apply mirror
     if mirror_axis == 'x':
@@ -790,11 +788,11 @@ def _worker(): torch.set_num_threads(1); os.environ.setdefault("OMP_NUM_THREADS"
 class CoordinateDataset(torch.utils.data.Dataset):
     def __init__(self, dxf_files):
         
-        self.dataset = []
+        self.dataset:List[Tensor] = []
         
         n_cpu = os.cpu_count()
         n_files = len(dxf_files)
-        chunksize = max(1, n_files // (n_cpu * 4))
+        chunksize = max(1, n_files // (n_cpu * 8))
         
         with Pool(processes=n_cpu, initializer=_worker, maxtasksperchild=100) as pool:
             for dataframe in tqdm(pool.imap_unordered(extract_coordinates, dxf_files, chunksize=chunksize), total=n_files, desc="Extracting coordinates"):
@@ -806,3 +804,100 @@ class CoordinateDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         return self.dataset[idx]
 
+from itertools import product
+
+def _build_graph(arguments:List[Tuple]) -> Data: dataframe, angle, axis = arguments; return create_graph(dataframe, angle, axis)
+
+class GraphDataset(torch.utils.data.Dataset):
+    def __init__(self, coordinate_dataset, rotations=[0], mirror_axes=[None]):
+        
+        self.dataset:list[Data] = []
+        
+        # Build argument list
+        arguments = [(dataframe, angle, axis) for dataframe, angle, axis in product(coordinate_dataset, rotations, mirror_axes)]
+        
+        n_cpu = os.cpu_count()
+        n_tasks = len(arguments)
+        chunksize = max(1, n_tasks // (n_cpu * 8))
+        
+        with Pool(processes=n_cpu, initializer=_worker, maxtasksperchild=100) as pool:
+            for data in tqdm(pool.imap_unordered(_build_graph, arguments, chunksize=chunksize), total=n_tasks, desc="Building graphs"):
+                self.dataset.append(data)
+        
+    def __len__(self):
+        return len(self.dataset)
+    
+    def __getitem__(self, idx):
+        return self.dataset[idx]
+
+import torch.nn as nn
+from torch_geometric.nn import PNAConv, TransformerConv, GraphNorm
+
+class _GNNLayerBlock(nn.Module):
+    def __init__(self, hidden_dimensions:int, dropout:float, conv:nn.Module):
+        super().__init__()
+        self.conv = conv
+        self.graph_norm = GraphNorm(hidden_dimensions)
+        self.drop = nn.Dropout(dropout)
+    
+    def forward(self, x, edge_index, edge_attr, batch):
+        h = self.graph_norm(x, batch); h = self.conv(h, edge_index, edge_attr); h = self.drop(h)
+        return x + h
+        
+class GraphNeuralNetwork(nn.Module):
+    def __init__(self, pna_degree):
+        super().__init__()
+        
+        node_attributes = 9
+        edge_attributes = 10
+        hidden_dimensions = 128
+        hidden_dimensions_edge = 64
+        dropout = 0.1
+        targets = 7
+        heads = 4
+        
+        # Small MLP to learn embeddings for coordinate features
+        self.embedding_layer = nn.Sequential(nn.Linear(node_attributes, hidden_dimensions), nn.ReLU(), nn.LayerNorm(hidden_dimensions))
+        
+        # Edge encoders (shared or per-block; here per block, small)
+        self.edge_layer = nn.Sequential(nn.Linear(edge_attributes, hidden_dimensions_edge), nn.ReLU(), 
+                                        nn.Linear(hidden_dimensions_edge, hidden_dimensions_edge), nn.ReLU(), nn.LayerNorm(hidden_dimensions_edge))
+        
+        # Block 1: Local (PNA) then Global (TransformerConv)
+        aggregators = ['mean', 'min', 'max', 'std']
+        scalers = ['identity', 'amplification', 'attenuation']
+        
+        self.pna1 = _GNNLayerBlock(hidden_dimensions, dropout,
+             PNAConv(in_channels=hidden_dimensions, out_channels=hidden_dimensions,
+                     aggregators=aggregators, scalers=scalers, deg=pna_degree, edge_dim=hidden_dimensions_edge))
+        
+        self.transformer1 = _GNNLayerBlock(hidden_dimensions, dropout,
+             TransformerConv(in_channels=hidden_dimensions, out_channels=hidden_dimensions, heads=heads, 
+                             concat=False, edge_dim=hidden_dimensions_edge, beta=True, dropout=dropout))
+        
+        # Block 2: Local + Global again
+        self.pna2 = _GNNLayerBlock(hidden_dimensions, dropout,
+             PNAConv(in_channels=hidden_dimensions, out_channels=hidden_dimensions,
+                     aggregators=aggregators, scalers=scalers, deg=pna_degree, edge_dim=hidden_dimensions_edge))
+        
+        self.transformer2 = _GNNLayerBlock(hidden_dimensions, dropout,
+             TransformerConv(in_channels=hidden_dimensions, out_channels=hidden_dimensions, heads=heads, 
+                             concat=False, edge_dim=hidden_dimensions_edge, beta=True, dropout=dropout))
+        
+        # Head
+        self.head = nn.Sequential(nn.LayerNorm(hidden_dimensions), 
+                                  nn.Linear(hidden_dimensions, 64), nn.ReLU(), 
+                                  nn.Dropout(0.3), nn.Linear(64, targets))
+        
+    def forward(self, data):
+        x, edge_index, edge_attr, batch = data.x, data.edge_index, data.edge_attr, data.batch
+        
+        x = self.embedding_layer(x)
+        e = self.edge_layer(edge_attr)
+        
+        x = self.pna1(x, edge_index, e, batch)
+        x = self.transformer1(x, edge_index, e, batch)
+        x = self.pna2(x, edge_index, e, batch)
+        x = self.transformer2(x, edge_index, e, batch)
+        
+        return self.head(x)  # [num_nodes_total, classes]

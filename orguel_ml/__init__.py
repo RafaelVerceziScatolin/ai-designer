@@ -1,1 +1,1 @@
-from .orguel_ml import (CoordinateDataset, create_graph)
+from .orguel_ml import (CoordinateDataset, GraphDataset)
