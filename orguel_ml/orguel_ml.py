@@ -901,3 +901,43 @@ class GraphNeuralNetwork(nn.Module):
         x = self.transformer2(x, edge_index, e, batch)
         
         return self.head(x)  # [num_nodes_total, classes]
+
+from torch_geometric.utils import degree
+
+def compute_pna_degree(dataset:GraphDataset|List[Data]) -> Tensor:
+    
+    degree_histogram = torch.tensor([0], dtype=torch.long, device='cpu')
+    
+    for data in dataset:
+        data_degree = degree(data.edge_index[0], num_nodes=data.num_nodes, dtype=torch.long)
+        max_degree = 1 + data_degree.max().item()
+        
+        if max_degree > degree_histogram.size(0):
+            new = torch.zeros(max_degree - degree_histogram.size(0), dtype=torch.long, device='cpu')
+            degree_histogram = torch.hstack([degree_histogram, new])
+        
+        degree_histogram[:max_degree] += torch.bincount(data_degree, minlength=max_degree)
+    
+    return degree_histogram
+
+from collections import Counter
+
+def balance_class_weights(dataset:GraphDataset|List[Data], n_targets, smoothing_exp=0.2, device=None) -> Tensor:
+    
+    assert device is not None, "name 'device' is not defined"
+    
+    label_counts = Counter()
+    for data in dataset: label_counts.update(data.y.tolist())
+    
+    total_labels = sum(label_counts.values())
+    
+    class_weights = []
+    for target in range(n_targets):
+        target_count = label_counts.get(target, 0)
+        balanced_weight = (total_labels / (2. * (target_count + 1))) ** smoothing_exp
+        class_weights.append(balanced_weight)
+    
+    class_weights = torch.tensor(class_weights, dtype=torch.float32, device='cpu')
+    class_weights = class_weights / class_weights.mean()
+    
+    return class_weights.to(device), label_counts
