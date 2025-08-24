@@ -529,7 +529,7 @@ class Graph:
     p95_length=450.
     line_obb_width=0.5
     parallel_max_offset=25.
-    parallel_angle_tolerance=0.01
+    parallel_angle_tolerance=0.1
     
     def detect_parallel(self, max_offset=None, angle_tolerance=None) -> Tuple[Tensor, Tensor]:
         F = _DataframeField
@@ -689,7 +689,7 @@ def extract_coordinates(dxf_file) -> Tensor:
 
 from torch_geometric.data import Data
 
-def create_graph(dataframe:Tensor, rotation=0., mirror_axis=None) -> Data:
+def create_graph(dataframe:Tensor, rotation=0., mirror_axis=None, raw_graph=False) -> Data | Graph:
     
     F = _DataframeField
     
@@ -776,6 +776,7 @@ def create_graph(dataframe:Tensor, rotation=0., mirror_axis=None) -> Data:
     dataframe[F.perimeter] = torch.where(is_circle_or_arc, dataframe[F.radius] * dataframe[F.arc_span], dataframe[F.perimeter])
     
     graph = Graph(dataframe)
+    if raw_graph: return graph
     
     return Data(x=graph.node_attributes, edge_index=graph.edge_pairs, edge_attr=graph.edge_attributes, y=dataframe[F.layer].long())
 
@@ -795,7 +796,7 @@ class CoordinateDataset(torch.utils.data.Dataset):
         chunksize = max(1, n_files // (n_cpu * 8))
         
         with Pool(processes=n_cpu, initializer=_worker, maxtasksperchild=100) as pool:
-            for dataframe in tqdm(pool.imap_unordered(extract_coordinates, dxf_files, chunksize=chunksize), total=n_files, desc="Extracting coordinates"):
+            for dataframe in tqdm(pool.imap(extract_coordinates, dxf_files, chunksize=chunksize), total=n_files, desc="Extracting coordinates"):
                 self.dataset.append(dataframe)
     
     def __len__(self):
@@ -806,12 +807,13 @@ class CoordinateDataset(torch.utils.data.Dataset):
 
 from itertools import product
 
-def _build_graph(arguments:List[Tuple]) -> Data: dataframe, angle, axis = arguments; return create_graph(dataframe, angle, axis)
+def _build_pyg_data(arguments:List[Tuple]) -> Data: dataframe, angle, axis = arguments; return create_graph(dataframe, angle, axis)
+def _build_graph_raw(arguments:List[Tuple]) -> Graph: dataframe, angle, axis = arguments; return create_graph(dataframe, angle, axis, raw_graph=True)
 
 class GraphDataset(torch.utils.data.Dataset):
-    def __init__(self, coordinate_dataset, rotations=[0], mirror_axes=[None]):
+    def __init__(self, coordinate_dataset, rotations=[0], mirror_axes=[None], raw_graphs=False):
         
-        self.dataset:list[Data] = []
+        self.dataset:list[Data|Graph] = []
         
         # Build argument list
         arguments = [(dataframe, angle, axis) for dataframe, angle, axis in product(coordinate_dataset, rotations, mirror_axes)]
@@ -820,9 +822,14 @@ class GraphDataset(torch.utils.data.Dataset):
         n_tasks = len(arguments)
         chunksize = max(1, n_tasks // (n_cpu * 8))
         
-        with Pool(processes=n_cpu, initializer=_worker, maxtasksperchild=100) as pool:
-            for data in tqdm(pool.imap_unordered(_build_graph, arguments, chunksize=chunksize), total=n_tasks, desc="Building graphs"):
-                self.dataset.append(data)
+        if raw_graphs: 
+            with Pool(processes=n_cpu, initializer=_worker, maxtasksperchild=100) as pool:
+                for graph in tqdm(pool.imap(_build_graph_raw, arguments, chunksize=chunksize), total=n_tasks, desc="Building (raw graphs)"):
+                    self.dataset.append(graph)
+        else: 
+            with Pool(processes=n_cpu, initializer=_worker, maxtasksperchild=100) as pool:
+                for data in tqdm(pool.imap_unordered(_build_pyg_data, arguments, chunksize=chunksize), total=n_tasks, desc="Building (pyg data)"):
+                    self.dataset.append(data)
         
     def __len__(self):
         return len(self.dataset)
