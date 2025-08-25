@@ -1,6 +1,6 @@
 from enum import IntEnum
 
-class _DataframeField(IntEnum):
+class DataframeField(IntEnum):
     original_index = 0
     layer = 1
     line_flag = 2
@@ -31,7 +31,7 @@ class _DataframeField(IntEnum):
     @classmethod
     def count(cls) -> int: return len(cls)
 
-class _EdgeAttribute(IntEnum):
+class EdgeAttribute(IntEnum):
     parallel = 0
     offset = 1
     overlap_ratio = 2
@@ -54,8 +54,8 @@ from torch import Tensor, newaxis
 class Graph:
     def __init__(self, dataframe:Tensor):
         
-        F = _DataframeField
-        Att = _EdgeAttribute
+        F = DataframeField
+        Att = EdgeAttribute
         
         self._dataframe = dataframe
         self._device = dataframe.device
@@ -76,11 +76,8 @@ class Graph:
         is_point = dataframe[F.point_flag] == 1
         is_circle = dataframe[F.circle_flag] == 1
         
-        dataframe[F.line_flag] = torch.where(is_point, 1, dataframe[F.line_flag])
-        dataframe[F.arc_flag] = torch.where(is_circle, 1, dataframe[F.arc_flag])
-        
-        line_flag = dataframe[F.line_flag].reshape([-1, 1]) # shape (N, 1)
-        arc_flag = dataframe[F.arc_flag].reshape([-1, 1]) # shape (N, 1)
+        line_flag = torch.where(is_point, 1, dataframe[F.line_flag]).reshape([-1, 1]) # shape (N, 1)
+        arc_flag = torch.where(is_circle, 1, dataframe[F.arc_flag]).reshape([-1, 1]) # shape (N, 1)
         
         # Normalize coordinates
         coordinates_x = torch.hstack([dataframe[F.start_x], dataframe[F.end_x]])
@@ -109,7 +106,7 @@ class Graph:
     @staticmethod
     def create_obbs(elements:Tensor, width:float, length_extension:float=0.) -> Tuple[Tensor, Tensor]:
         
-        F = _DataframeField
+        F = DataframeField
         n_elements = elements.size(1)
         
         # Filter supported elements
@@ -190,7 +187,7 @@ class Graph:
     @staticmethod
     def find_overlaping_pairs(elements:Tensor, obbs:Tensor) -> Tuple[Tensor, Tensor]:
         
-        F = _DataframeField
+        F = DataframeField
         
         # Compute AABBs (Axis-Aligned Bounding Boxes)
         min_x = obbs[..., 0].min(dim=1).values
@@ -237,7 +234,7 @@ class Graph:
     @staticmethod
     def get_overlap_ratios(lines_a:Tensor, lines_b:Tensor) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
         
-        F = _DataframeField
+        F = DataframeField
         
         # Project B's endpoints onto A
         t1 = (lines_b[F.start_x] - lines_a[F.start_x]) * lines_a[F.u_x] + \
@@ -277,7 +274,7 @@ class Graph:
     def _get_line_arc_intersections(lines:Tensor, arcs:Tensor, margin:float) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, 
                                                                                       Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
         
-        F = _DataframeField
+        F = DataframeField
         
         dx_start = arcs[F.center_x] - lines[F.start_x]
         dy_start = arcs[F.center_y] - lines[F.start_y]
@@ -417,7 +414,7 @@ class Graph:
     def get_intersection_positions(elements_a:Tensor, elements_b:Tensor, margin:float, angle_tolerance:float) -> \
         Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
         
-        F = _DataframeField
+        F = DataframeField
         device = elements_a.device
         n_pairs = elements_a.size(1)
         
@@ -532,7 +529,7 @@ class Graph:
     parallel_angle_tolerance=0.1
     
     def detect_parallel(self, max_offset=None, angle_tolerance=None) -> Tuple[Tensor, Tensor]:
-        F = _DataframeField
+        F = DataframeField
         dataframe = self._dataframe
         max_offset = max_offset or self.parallel_max_offset
         angle_tolerance = math.radians(angle_tolerance or self.parallel_angle_tolerance)
@@ -566,7 +563,7 @@ class Graph:
         overlap_a_b, distance_a_b, overlap_b_a, distance_b_a = self.get_overlap_ratios(lines_a, lines_b)
         
         # Create edges
-        Att = _EdgeAttribute
+        Att = EdgeAttribute
         
         i, j = lines_a[F.original_index].long(), lines_b[F.original_index].long()
         
@@ -596,7 +593,7 @@ class Graph:
         return edge_pairs, attributes
      
     def detect_intersection(self, obb_width=None, angle_tolerance=None) -> Tuple[Tensor, Tensor]:
-        F = _DataframeField
+        F = DataframeField
         dataframe = self._dataframe
         obb_width = obb_width or self.line_obb_width
         angle_tolerance = math.radians(angle_tolerance or self.parallel_angle_tolerance)
@@ -616,7 +613,7 @@ class Graph:
         = self.get_intersection_positions(elements_a, elements_b, margin=obb_width, angle_tolerance=angle_tolerance)
         
         # Create edges
-        Att = _EdgeAttribute
+        Att = EdgeAttribute
         
         i, j = elements_a[F.original_index].long(), elements_b[F.original_index].long()
         
@@ -657,7 +654,7 @@ def extract_coordinates(dxf_file) -> Tensor:
     
     entities = [entity for entity in modelspace if entity.dxftype() in supported_entities]
     
-    F = _DataframeField
+    F = DataframeField
     dataframe = torch.zeros((F.count(), len(entities)), dtype=torch.float32, device='cpu')
     
     for i, entity in enumerate(entities):
@@ -689,9 +686,9 @@ def extract_coordinates(dxf_file) -> Tensor:
 
 from torch_geometric.data import Data
 
-def create_graph(dataframe:Tensor, rotation=0., mirror_axis=None, raw_graph=False) -> Data | Graph:
+def create_graph(dataframe:Tensor, mirror_axis=None, rotation=0., raw_graph=False) -> Data | Graph:
     
-    F = _DataframeField
+    F = DataframeField
     
     rotation = math.radians(rotation)
     
@@ -807,16 +804,16 @@ class CoordinateDataset(torch.utils.data.Dataset):
 
 from itertools import product
 
-def _build_pyg_data(arguments:List[Tuple]) -> Data: dataframe, angle, axis = arguments; return create_graph(dataframe, angle, axis)
-def _build_graph_raw(arguments:List[Tuple]) -> Graph: dataframe, angle, axis = arguments; return create_graph(dataframe, angle, axis, raw_graph=True)
+def _build_pyg_data(arguments:Tuple) -> Data: dataframe, axis, angle = arguments; return create_graph(dataframe.clone(), axis, angle)
+def _build_graph_raw(arguments:Tuple) -> Graph: dataframe, axis, angle = arguments; return create_graph(dataframe.clone(), axis, angle, raw_graph=True)
 
 class GraphDataset(torch.utils.data.Dataset):
-    def __init__(self, coordinate_dataset, rotations=[0], mirror_axes=[None], raw_graphs=False):
+    def __init__(self, coordinate_dataset, mirror_axes=[None], rotations=[0.], raw_graphs=False):
         
         self.dataset:list[Data|Graph] = []
         
         # Build argument list
-        arguments = [(dataframe, angle, axis) for dataframe, angle, axis in product(coordinate_dataset, rotations, mirror_axes)]
+        arguments = [(dataframe, axis, angle) for dataframe, axis, angle in product(coordinate_dataset, mirror_axes, rotations)]
         
         n_cpu = os.cpu_count()
         n_tasks = len(arguments)
