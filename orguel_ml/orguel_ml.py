@@ -49,7 +49,7 @@ class EdgeAttribute(IntEnum):
 from typing import Tuple, List
 import math
 import torch
-from torch import Tensor, newaxis
+from torch import Tensor
 
 class Graph:
     def __init__(self, dataframe:Tensor):
@@ -196,8 +196,8 @@ class Graph:
         max_y = obbs[..., 1].max(dim=1).values
         
         # Computing AABB intersection matrix
-        mask_x = (min_x[:, newaxis] <= max_x[newaxis, :]) & (min_x[newaxis, :] <= max_x[:, newaxis])
-        mask_y = (min_y[:, newaxis] <= max_y[newaxis, :]) & (min_y[newaxis, :] <= max_y[:, newaxis])
+        mask_x = (min_x[:, None] <= max_x[None, :]) & (min_x[None, :] <= max_x[:, None])
+        mask_y = (min_y[:, None] <= max_y[None, :]) & (min_y[None, :] <= max_y[:, None])
         aabb_overlap = mask_x & mask_y
         
         # Candidate pairs
