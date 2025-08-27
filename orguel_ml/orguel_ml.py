@@ -856,7 +856,7 @@ class GraphNeuralNetwork(nn.Module):
         edge_attributes = 10
         hidden_dimensions = 128
         hidden_dimensions_edge = 64
-        dropout = 0.1
+        dropout = 0.2
         targets = 7
         heads = 4
         
