@@ -3,30 +3,32 @@ from enum import IntEnum
 class DataframeField(IntEnum):
     original_index = 0
     layer = 1
-    line_flag = 2
-    circle_flag = 3
-    arc_flag = 4
-    point_flag = 5
-    start_x = 6
-    start_y = 7
-    end_x = 8
-    end_y = 9
-    mid_x = 10
-    mid_y = 11
-    angle = 12
-    length = perimeter = 13
-    d_x = 14
-    d_y = 15
-    u_x = t_x = 16
-    u_y = t_y = 17
-    n_x = r_x = 18
-    n_y = r_y = 19
-    center_x = 20
-    center_y = 21
-    radius = 22
-    start_angle = 23
-    end_angle = 24
-    arc_span = 25
+    target = 2
+    line_flag = 3
+    text_flag = 4
+    circle_flag = 5
+    arc_flag = 6
+    point_flag = 7
+    start_x = 8
+    start_y = 9
+    end_x = 10
+    end_y = 11
+    mid_x = 12
+    mid_y = 13
+    angle = 14
+    length = perimeter = 15
+    d_x = 16
+    d_y = 17
+    u_x = t_x = 18
+    u_y = t_y = 19
+    n_x = r_x = 20
+    n_y = r_y = 21
+    center_x = 22
+    center_y = 23
+    radius = 24
+    start_angle = 25
+    end_angle = 26
+    arc_span = 27
     
     @classmethod
     def count(cls) -> int: return len(cls)
@@ -641,39 +643,51 @@ class Graph:
         attributes[edges_j_i:, Att.angle_difference_cos_max] = angle_difference_b_a_cos_max
         
         return edge_pairs, attributes
-     
+
+import os
+import json
+from pathlib import Path
+
+supported_entities = ('LINE', 'TEXT', 'POINT', 'CIRCLE', 'ARC')
+
+_layers_json = Path(os.getenv("HD")) / "classification_layers.json"
+with open(_layers_json, "r") as file: class_dictionary = json.load(file)
+
 import ezdxf
 
-supported_entities = ('LINE', 'POINT', 'CIRCLE', 'ARC')
-supported_layers = {"beam": 0, "column": 1, "eave": 2, "hole_slab": 3, "stair": 4, "section": 5, "info": 6}
-
-def extract_coordinates(dxf_file) -> Tensor:
+def extract_coordinates(dxf_file:Tuple) -> Tensor:
     
-    doc = ezdxf.readfile(dxf_file)
-    modelspace = doc.modelspace()
+    dxf_original, dxf_target = dxf_file
     
+    doc = ezdxf.readfile(dxf_original); modelspace = doc.modelspace()
     entities = [entity for entity in modelspace if entity.dxftype() in supported_entities]
+    
+    layers = [entity.dxf.layer for entity in entities]
+    layer_dictionary = {layer: i for i, layer in enumerate(sorted(set(layers)))}
+    
+    doc = ezdxf.readfile(dxf_target); modelspace = doc.modelspace()
+    targets = [entity.dxf.layer for entity in modelspace if entity.dxftype() in supported_entities]
     
     F = DataframeField
     dataframe = torch.zeros((F.count(), len(entities)), dtype=torch.float32, device='cpu')
     
     for i, entity in enumerate(entities):
         dataframe[F.original_index,i] = i
+        dataframe[F.layer,i] = layer_dictionary[layers[i]]
+        dataframe[F.target,i] = class_dictionary.get(targets[i], -1)
         entity_type = entity.dxftype()
-        entity_layer = entity.dxf.layer
-        
-        if entity_layer in supported_layers: dataframe[F.layer,i] = supported_layers[entity_layer]
-        else: dataframe[F.layer,i] = -1; print(f"[Unsupported layer] '{entity_layer}' in file '{dxf_file}'")
         
         if entity_type == 'LINE':
-            dataframe[F.line_flag,i] = 1
-            dataframe[F.start_x,i], dataframe[F.start_y,i], _ = entity.dxf.start
-            dataframe[F.end_x,i], dataframe[F.end_y,i], _ = entity.dxf.end
+                dataframe[F.line_flag,i] = 1
+                dataframe[F.start_x,i], dataframe[F.start_y,i], _ = entity.dxf.start
+                dataframe[F.end_x,i], dataframe[F.end_y,i], _ = entity.dxf.end
+        
+        elif entity_type == 'TEXT': None
         
         elif entity_type == 'POINT':
-            dataframe[F.point_flag,i] = 1
-            dataframe[F.start_x,i], dataframe[F.start_y,i], _ = entity.dxf.location
-            
+                dataframe[F.point_flag,i] = 1
+                dataframe[F.start_x,i], dataframe[F.start_y,i], _ = entity.dxf.location
+                
         elif entity_type in ('CIRCLE', 'ARC'):
             dataframe[F.circle_flag,i] = 1 if entity_type == 'CIRCLE' else 0
             dataframe[F.arc_flag,i] = 1 if entity_type == 'ARC' else 0
@@ -681,7 +695,7 @@ def extract_coordinates(dxf_file) -> Tensor:
             dataframe[F.center_x,i], dataframe[F.center_y,i], _ = entity.dxf.center
             dataframe[F.start_angle,i] = 0 if entity_type == 'CIRCLE' else entity.dxf.start_angle
             dataframe[F.end_angle,i] = 360 if entity_type == 'CIRCLE' else entity.dxf.end_angle
-        
+    
     return dataframe
 
 from torch_geometric.data import Data
@@ -777,14 +791,13 @@ def create_graph(dataframe:Tensor, mirror_axis=None, rotation=0., raw_graph=Fals
     
     return Data(x=graph.node_attributes, edge_index=graph.edge_pairs, edge_attr=graph.edge_attributes, y=dataframe[F.layer].long())
 
-import os
 from tqdm import tqdm
 from multiprocessing import Pool
 
 def _worker(): torch.set_num_threads(1); os.environ.setdefault("OMP_NUM_THREADS", "1")
 
 class CoordinateDataset(torch.utils.data.Dataset):
-    def __init__(self, dxf_files):
+    def __init__(self, dxf_files:List[Tuple]):
         
         self.dataset:List[Tensor] = []
         

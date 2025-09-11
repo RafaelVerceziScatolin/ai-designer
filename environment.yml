@@ -1,13 +1,7 @@
-name: dl_torch # install with: conda env create -f environment.yml
-channels:
-  - rapidsai
-  - pytorch
-  - pyg
-  - nvidia
-  - conda-forge
+name: dl_torch
+channels: [pytorch, pyg, nvidia, conda-forge]
 dependencies:
   - python=3.10
-  - cudf=23.12
   - matplotlib
   - scikit-learn
   - scipy
@@ -22,14 +16,10 @@ dependencies:
   - pytorch
   - torchvision
   - torchaudio
-  - pytorch-cuda=12.1
   - pytorch-lightning
   - tensorboard
   - pyg
-  - torch-scatter
   - pynvml
   - pip
   - pip:
       - tqdm_joblib
-      - --extra-index-url https://pip.cupy.dev
-      - cupy-cuda12x

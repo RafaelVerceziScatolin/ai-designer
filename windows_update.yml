@@ -1,0 +1,3 @@
+name: dl_torch
+variables:
+  HD: "D:\\HD_dl_torch"

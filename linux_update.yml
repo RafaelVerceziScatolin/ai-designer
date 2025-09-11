@@ -1,0 +1,11 @@
+name: dl_torch
+channels: [rapidsai]
+dependencies:
+  - cudf=23.12
+  - pytorch-cuda=12.1
+  - torch-scatter
+  - pip:
+      - --extra-index-url https://pip.cupy.dev
+      - cupy-cuda12x
+variables:
+  HD: "/media/rafael/HD/HD_dl_torch"
